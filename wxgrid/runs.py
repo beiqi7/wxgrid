@@ -22,6 +22,14 @@ class Run:
         """``YYYYMMDDHH``."""
         return f"{self.date:%Y%m%d}{self.hour:02d}"
 
+    @classmethod
+    def from_stamp(cls, stamp: str) -> "Run":
+        """Parse ``YYYYMMDDHH`` (the ``--run`` CLI form) into a :class:`Run`."""
+        s = str(stamp).strip()
+        if len(s) != 10 or not s.isdigit():
+            raise ValueError(f"run stamp must be YYYYMMDDHH, got {stamp!r}")
+        return cls(dt.date(int(s[0:4]), int(s[4:6]), int(s[6:8])), int(s[8:10]))
+
     @property
     def init_time(self) -> dt.datetime:
         return dt.datetime(self.date.year, self.date.month, self.date.day, self.hour, tzinfo=dt.timezone.utc)

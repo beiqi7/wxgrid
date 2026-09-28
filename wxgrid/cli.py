@@ -17,6 +17,7 @@ from . import downscale, pipeline, points as points_mod, probability, report, st
 from .sources import gefs as gefs_mod
 from .sources import REGISTRY
 from .sources._fetch import session
+from .runs import Run
 
 
 def _parse_weights(text: str | None) -> dict[str, float] | None:
@@ -104,9 +105,14 @@ def cmd_bulletin(args) -> int:
     steps = pipeline.step_grid(days * 24, args.every)
     sources = tuple(args.sources.split(","))
     sess = pipeline.session()
-    run = pipeline.common_run(sources, steps, sess=sess, min_age_hours=args.min_age_hours)
+    if args.run:
+        run = Run.from_stamp(args.run)
+        missing = [s for s in sources if not REGISTRY[s].probe_run(sess, run, max(steps))]
+        if missing:
+            raise SystemExit(f"run {args.run}: sources {missing} not published out to {max(steps)}h")
+    else:
+        run = pipeline.common_run(sources, steps, sess=sess, min_age_hours=args.min_age_hours)
 
-    daily = None
     member_ds = pipeline.forecast(pts, steps=steps, sources=sources, pad=args.pad,
                                   weights=_parse_weights(args.weights),
                                   cfg=downscale.DownscaleConfig(), sess=sess, run=run)

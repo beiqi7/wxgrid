@@ -23,7 +23,7 @@ import xarray as xr
 DEFAULT_WEIGHTS = {"ecmwf-ifs-0p25": 0.6, "gfs-0p25": 0.4}
 
 #: Variables blended linearly. Wind direction is re-derived from blended u/v.
-_SCALAR = ("t2m", "tmax3", "tmin3", "wind_speed", "precip", "precip_accum", "snow", "cloud")
+_SCALAR = ("t2m", "tmax3", "tmin3", "wind_speed", "gust", "precip", "precip_accum", "snow", "cloud")
 
 
 def weights_from_skill(rmse: dict[str, float], *, floor: float = 1e-3) -> dict[str, float]:

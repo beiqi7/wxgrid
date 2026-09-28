@@ -43,10 +43,17 @@ def write_sqlite(frames: list[pd.DataFrame], path: str | pathlib.Path, *, table:
 
 def write_netcdf(per_source: dict[str, xr.Dataset], path: str | pathlib.Path) -> None:
     """One file, one ``member`` dimension holding each source plus the blend."""
+    first = next(iter(per_source.values()))
     stack = xr.concat(
         [ds.drop_vars([c for c in ds.coords if c not in ds.dims], errors="ignore") for ds in per_source.values()],
         dim="member", join="exact",
     ).assign_coords(member=list(per_source))
+    # These coords are identical across members (the blend copies the first's),
+    # so re-attach them once instead of dropping them — `valid_time` in particular
+    # is what `to_frame`/`calibrate` read back out of the file.
+    for c in ("valid_time", "latitude", "longitude", "elevation", "model_elevation", "name"):
+        if c in first.coords:
+            stack = stack.assign_coords({c: first[c]})
     p = pathlib.Path(path)
     if p.exists():
         p.unlink()

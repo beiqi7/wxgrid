@@ -119,22 +119,31 @@ def apply(ds: xr.Dataset, cal: Calibration, *, copy: bool = True) -> xr.Dataset:
     ids = [str(p) for p in ds["point"].values]
 
     if cal.bias_t2m:
-        b = np.array([cal.bias_t2m.get(p, 0.0) for p in ids])
-        out["t2m_raw"] = ds["t2m"]
-        out["t2m"] = ds["t2m"] + xr.DataArray(b, dims="point", coords={"point": ds["point"]})
+        b = xr.DataArray(np.array([cal.bias_t2m.get(p, 0.0) for p in ids]),
+                         dims="point", coords={"point": ds["point"]})
+        # tmax3/tmin3 are temperatures too and drive the daily tmax/tmin, so the
+        # same offset has to reach them or the corrected report keeps the raw extremes.
+        for var in ("t2m", "tmax3", "tmin3"):
+            if var in ds:
+                out[f"{var}_raw"] = ds[var]
+                out[var] = ds[var] + b
 
     if cal.wind_factor:
-        k = np.array([cal.wind_factor.get(p, 1.0) for p in ids])
+        k = xr.DataArray(np.array([cal.wind_factor.get(p, 1.0) for p in ids]),
+                         dims="point", coords={"point": ds["point"]})
         out["wind_speed_raw"] = ds["wind_speed"]
-        out["wind_speed"] = ds["wind_speed"] * xr.DataArray(k, dims="point", coords={"point": ds["point"]})
-        for comp in ("u10", "v10"):
+        out["wind_speed"] = ds["wind_speed"] * k
+        for comp in ("u10", "v10", "gust"):
             if comp in ds:
-                out[comp] = ds[comp] * xr.DataArray(k, dims="point", coords={"point": ds["point"]})
+                out[comp] = ds[comp] * k
 
     if cal.precip_factor:
-        k = np.array([cal.precip_factor.get(p, 1.0) for p in ids])
-        out["precip_raw"] = ds["precip"]
-        out["precip"] = ds["precip"] * xr.DataArray(k, dims="point", coords={"point": ds["point"]})
+        k = xr.DataArray(np.array([cal.precip_factor.get(p, 1.0) for p in ids]),
+                         dims="point", coords={"point": ds["point"]})
+        for var in ("precip", "precip_accum"):
+            if var in ds:
+                out[f"{var}_raw"] = ds[var]
+                out[var] = ds[var] * k
 
     out.attrs = dict(out.attrs)
     out.attrs["calibration"] = cal.window or "none"

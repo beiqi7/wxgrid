@@ -131,11 +131,18 @@ def compass(deg: float) -> str:
 DAY_START_H, NIGHT_START_H = 8, 20
 
 
-def _half_of(valid_time: np.ndarray, tz_hours: float, kind: str) -> tuple[np.ndarray, np.ndarray]:
-    """``(day_index, mask)`` for the local day- or night-time half."""
-    local_h = valid_time.astype("datetime64[s]").astype("int64") // 3600 + int(round(tz_hours * 3600)) // 3600
-    day = local_h // 24
-    hour = local_h % 24
+def _half_of(valid_time: np.ndarray, tz_hours: float, kind: str, gap: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(day_index, mask)`` for the local day- or night-time half.
+
+    A step's value covers the window ``(valid_time - gap, valid_time]``, so the
+    half it belongs to is decided by where that window *sits*, i.e. its start
+    hour ``local_end - gap`` — not its end. Keying on the end put the 05→08
+    window in the daytime and the 17→20 window in the night.
+    """
+    local_end = valid_time.astype("datetime64[s]").astype("int64") // 3600 + int(round(tz_hours * 3600)) // 3600
+    local_start = local_end - gap
+    day = local_start // 24
+    hour = local_start % 24
     if kind == "day":
         return day, (hour >= DAY_START_H) & (hour < NIGHT_START_H)
     # The night that belongs to date D runs D 20:00 -> D+1 08:00.
@@ -150,11 +157,13 @@ def half_day(ds: xr.Dataset, *, tz_hours: float = TZ_CHINA) -> xr.Dataset:
     single daily number.
     """
     vt = ds["valid_time"].values
+    steps = ds["step"].values.astype(int)
+    gap = int(np.median(np.diff(steps))) if len(steps) > 1 else 3
     base = to_daily(ds, tz_hours=tz_hours)
     days = base["day"].values.astype("datetime64[D]").astype(int)
     out = {}
     for half in ("day", "night"):
-        idx, mask = _half_of(vt, tz_hours, half)
+        idx, mask = _half_of(vt, tz_hours, half, gap)
         for var, how in (("precip", "sum"), ("snow", "sum"), ("cloud", "mean")):
             if var not in ds:
                 out[f"{half}_{var}"] = np.zeros((ds.sizes["point"], days.size))
@@ -177,8 +186,8 @@ def precip_windows(ds: xr.Dataset, *, tz_hours: float = TZ_CHINA,
     """``{(point_id, 'YYYY-MM-DD'): [(start_h, end_h), ...]}`` in local hours.
 
     Each 3-hourly increment covers ``(step-gap, step]`` hours after init, so a
-    window is the local time span of the steps that actually carry rain. A day
-    keeps the windows that *start* in it, which is how a daily table reads.
+    window is the local time span of the steps that actually carry rain. A span
+    that crosses local midnight is split so every day it touches lists it.
     """
     steps = ds["step"].values.astype(int)
     gap = int(np.median(np.diff(steps))) if len(steps) > 1 else 3
@@ -201,21 +210,18 @@ def precip_windows(ds: xr.Dataset, *, tz_hours: float = TZ_CHINA,
             else:
                 merged.append([lo, hi])
         for lo, hi in merged:
-            key = str(np.datetime64(int(lo) // 24, "D"))
-            out.setdefault((str(pid), key), []).append((lo % 24, hi % 24))
+            a = int(lo)
+            while a < hi:  # split at local midnight so each day lists its own hours
+                d = a // 24
+                b = min(int(hi), (d + 1) * 24)
+                key = str(np.datetime64(int(d), "D"))
+                out.setdefault((str(pid), key), []).append((a - d * 24, b - d * 24))
+                a = b
     return out
 
 
 def format_windows(spans: list[tuple[int, int]] | None) -> str:
-    """``20—23时`` / ``23—次日02时`` / ``02—05时、14—17时``."""
+    """``20—24时`` / ``02—05时、14—17时`` — hours are within one local day (end up to 24)."""
     if not spans:
         return "无"
-    parts = []
-    for start, end in spans:
-        if end == 0:
-            parts.append(f"{start:02d}—次日00时")
-        elif end < start:
-            parts.append(f"{start:02d}—次日{end:02d}时")
-        else:
-            parts.append(f"{start:02d}—{end:02d}时")
-    return "、".join(parts)
+    return "、".join(f"{start:02d}—{end:02d}时" for start, end in spans)

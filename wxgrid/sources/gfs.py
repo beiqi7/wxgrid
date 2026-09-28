@@ -41,9 +41,9 @@ PARAMS: dict[tuple[str, str], str] = {
     ("APCP", "surface"): "tp",
     ("GUST", "surface"): "gust",
     ("TCDC", "entire atmosphere"): "tcc",
-    # WEASD is the snow water equivalent *on the ground*, not fresh snowfall:
-    # the downscaler differences it and clips at zero, which recovers the
-    # interval's snowfall. GFS pgrb2.0p25 carries no ASNOW.
+    # WEASD is snow water equivalent *on the ground*, not fresh snowfall. fetch()
+    # subtracts the analysis (f000) snowpack so `snow` becomes accumulation from
+    # init (like `tp`); the downscaler then differences it into per-step snowfall.
     ("WEASD", "surface"): "snow",
 }
 #: Extras that improve the daily aggregation; absent fields are simply skipped.
@@ -237,4 +237,10 @@ def fetch(run: Run, steps: list[int], *, params: dict[tuple[str, str], str] | No
     if "orog" in ds:  # orography is static; surface pressure is not
         keep = ds["orog"].isel(step=0, drop=True)
         ds = ds.drop_vars("orog").merge(keep)
+    if "snow" in ds and 0 not in {int(s) for s in steps}:
+        # Rebase onto the analysis (f000) snowpack: WEASD is snow on the ground, so
+        # without this the earliest step books pre-existing snow as fresh snowfall.
+        base = _normalise(decode_grib(_read_step(sess, run, 0, {("WEASD", "surface"): "snow"})), run, 0, bbox)
+        if "snow" in base:
+            ds["snow"] = (ds["snow"] - base["snow"].isel(step=0, drop=True)).clip(min=0.0)
     return ForecastGrid(ds.sortby("step"), "gfs-0p25")
