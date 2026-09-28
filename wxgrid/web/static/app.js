@@ -1,45 +1,74 @@
 /* wxgrid web UI — vanilla JS, no build step, no CDN.
  *
- * Reads the published product from the read-only API and renders:
- * hero + alerts, 5-day strip, temperature/precipitation SVG charts,
- * a township scatter map, a per-day township table, and the bulletin text.
+ * Single-column narrative: today at the county seat first, then the five-day
+ * track, then the townships ranked by elevation (the whole point of the system),
+ * then the plain-text bulletin and the API reference folded away.
+ *
+ * DOM contract: every id used here exists in index.html, and every class emitted
+ * here has a rule in styles.css. Township-row classes are `r-*`, hero classes
+ * `t-*`, sheet classes `s-*`, rail classes `d-*`, alert classes `a-*`.
  */
 'use strict';
 
 const S = {
-  doc: null,        // the full product JSON
-  runs: [],         // index.json entries
-  dayIdx: { temp: 0, precip: 0, table: 0 },
-  mapMetric: 'tmax',
-  mapDay: 0,
+  doc: null,      // full product JSON
+  runs: [],       // index.json entries
+  day: 0,         // selected day for the township band
+  names: null,    // id -> name
+  back: null,     // element to refocus when the sheet closes
 };
 
 const $ = (id) => document.getElementById(id);
-const el = (tag, cls, txt) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (txt !== undefined && txt !== null) n.textContent = String(txt);
-  return n;
-};
-const num = (v, d = 0) => (v === null || v === undefined || Number.isNaN(v) ? '—' : Number(v).toFixed(d));
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const n1 = (v, d = 0) => (v === null || v === undefined || Number.isNaN(v) ? '—' : Number(v).toFixed(d));
+const pct10 = (p) => (p === null || p === undefined ? null : Math.round(p / 10) * 10);
+const md = (iso) => `${Number(iso.slice(5, 7))}月${Number(iso.slice(8, 10))}日`;
+const RANK = { 蓝色: 1, 黄色: 2, 橙色: 3, 红色: 4 };
+const ALERT_CLASS = { 红色: 'a-red', 橙色: 'a-orange', 黄色: 'a-yellow', 蓝色: 'a-blue' };
 
-/* ---------- theme ---------- */
+/* ---------- theme: day / night ---------- */
 function initTheme() {
-  const saved = localStorage.getItem('wxgrid-theme');
-  if (saved) document.documentElement.dataset.theme = saved;
+  // index.html already applied the saved theme in <head> to avoid a flash.
   paintThemeBtn();
-  $('theme-toggle').addEventListener('click', () => {
-    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  $('theme').addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'night' ? 'day' : 'night';
     document.documentElement.dataset.theme = next;
-    localStorage.setItem('wxgrid-theme', next);
-    paintThemeBtn();
-    if (S.doc) renderAll();  // charts embed theme colours
+    try { localStorage.setItem('wxgrid-theme', next); } catch { /* private mode */ }
+    paintThemeBtn();  // every colour is a CSS variable, nothing to re-render
   });
 }
 function paintThemeBtn() {
-  $('theme-toggle').textContent = document.documentElement.dataset.theme === 'dark' ? '☀' : '☾';
+  const night = document.documentElement.dataset.theme === 'night';
+  $('theme').textContent = night ? '日间' : '夜间';
+  $('theme').setAttribute('aria-label', night ? '切换到日间主题' : '切换到夜间主题');
 }
-const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+/* ---------- temperature → colour ----------
+ * One fixed scale for the whole page, so 19° looks the same on every row and
+ * every day, and a cool ridge township is visibly cooler than the valley. */
+const TSTOPS = [
+  [-10, [104, 110, 240]], [0, [86, 156, 255]], [10, [64, 196, 222]], [18, [96, 204, 150]],
+  [24, [236, 196, 64]], [30, [255, 146, 64]], [35, [242, 88, 70]], [40, [206, 40, 92]],
+];
+function tcol(t) {
+  if (!Number.isFinite(t)) return 'transparent';
+  if (t <= TSTOPS[0][0]) return `rgb(${TSTOPS[0][1].join(' ')})`;
+  for (let i = 1; i < TSTOPS.length; i++) {
+    const [t1, c1] = TSTOPS[i];
+    if (t <= t1) {
+      const [t0, c0] = TSTOPS[i - 1];
+      const k = (t - t0) / (t1 - t0);
+      return `rgb(${c0.map((v, j) => Math.round(v + (c1[j] - v) * k)).join(' ')})`;
+    }
+  }
+  return `rgb(${TSTOPS[TSTOPS.length - 1][1].join(' ')})`;
+}
+/** CSS gradient that follows tcol() between lo and hi. */
+function tgrad(lo, hi, dir) {
+  const n = 6;
+  const stops = Array.from({ length: n + 1 }, (_, i) => tcol(lo + ((hi - lo) * i) / n));
+  return `linear-gradient(${dir},${stops.join(',')})`;
+}
 
 /* ---------- data ---------- */
 async function api(path) {
@@ -48,71 +77,32 @@ async function api(path) {
   return r.json();
 }
 
-/** township id -> display name, from the product's roster. */
 function nameOf(id) {
-  if (!S._names) S._names = new Map((S.doc.townships || []).map(t => [t.id, t.name]));
-  return S._names.get(id) || id;
+  if (!S.names) S.names = new Map((S.doc.townships || []).map(t => [t.id, t.name]));
+  return S.names.get(id) || id;
+}
+/* The county seat's township id. Products published before seat_id was added to
+ * `conclusions` only carry meta.seat (a name), so match on that as a fallback. */
+function seatId() {
+  const sid = S.doc.conclusions && S.doc.conclusions.seat_id;
+  if (sid) return sid;
+  const t = (S.doc.townships || []).find(x => x.name === S.doc.meta.seat);
+  return t ? t.id : null;
+}
+/* The seat's cell for a day; if the seat is not in the roster, the first cell.
+ * The hero labels the place with nameOf(cell.point), so a fallback is never mislabelled. */
+function seatCell(dayIdx) {
+  const day = S.doc.days[dayIdx];
+  if (!day) return null;
+  const sid = seatId();
+  return day.cells.find(c => c.point === sid) || day.cells[0] || null;
 }
 
-async function boot() {
-  initTheme();
-  wireStatic();
-  try {
-    S.doc = await api('/api/latest');
-  } catch (err) {
-    return fail(`还没有已发布的预报产品。请先运行一次 <code>python3 -m wxgrid publish</code>。<br><small>${err.message}</small>`);
-  }
-  try {
-    S.runs = await api('/api/runs');
-  } catch { S.runs = []; }
-  fillRunSelect();
-  renderApi();
-  renderAll();
-}
-
-function fail(html) {
-  const hero = $('hero');
-  hero.classList.remove('is-loading');
-  hero.innerHTML = `<div class="hero-empty">${html}</div>`;
-}
-
-function fillRunSelect() {
-  const sel = $('run-select');
-  sel.innerHTML = '';
-  const cur = S.doc.meta.run;
-  const seen = new Set();
-  for (const r of S.runs) {
-    if (seen.has(r.file)) continue;
-    seen.add(r.file);
-    const o = el('option', null, `${r.run} · ${r.county || ''}`.trim());
-    o.value = r.file;
-    if (r.run === cur) o.selected = true;
-    sel.appendChild(o);
-  }
-  if (!S.runs.length) {
-    const o = el('option', null, `${cur}（当前）`);
-    o.value = '';
-    sel.appendChild(o);
-  }
-  sel.addEventListener('change', async () => {
-    if (!sel.value) return;
-    sel.disabled = true;
-    try {
-      S.doc = await api(`/api/runs/${encodeURIComponent(sel.value)}`);
-      S.dayIdx = { temp: 0, precip: 0, table: 0 };
-      S.mapDay = 0;
-      S._names = null;  // roster belongs to the previous run
-      renderAll();
-    } catch (err) { fail(err.message); }
-    sel.disabled = false;
-  });
-}
-
-/* ---------- weather icons (inline SVG, keyed off the Chinese phrase) ---------- */
-function iconKind(text) {
+/* ---------- weather → icon kind ---------- */
+function kindOf(text) {
   const t = text || '';
   if (t.includes('雪')) return 'snow';
-  if (t.includes('暴雨')) return 'storm';
+  if (t.includes('暴雨') || t.includes('雷')) return 'storm';
   if (t.includes('大雨') || t.includes('中雨')) return 'rain';
   if (t.includes('雨')) return 'drizzle';
   if (t.includes('阴')) return 'overcast';
@@ -121,480 +111,407 @@ function iconKind(text) {
   return 'clear';
 }
 
-const ICON = {
-  clear: '<circle cx="24" cy="24" r="9" class="i-sun"/><g class="i-ray">' +
-    [0, 45, 90, 135, 180, 225, 270, 315].map(a =>
-      `<line x1="24" y1="6" x2="24" y2="12" transform="rotate(${a} 24 24)"/>`).join('') + '</g>',
-  partly: '<circle cx="18" cy="19" r="7.5" class="i-sun"/><path class="i-cloud" d="M20 35h13a6 6 0 0 0 .6-12 8.5 8.5 0 0 0-16.1 2.3A5.5 5.5 0 0 0 20 35z"/>',
-  cloudy: '<path class="i-cloud" d="M16 34h16a6.5 6.5 0 0 0 .7-13 9.5 9.5 0 0 0-18 2.6A5.8 5.8 0 0 0 16 34z"/>',
-  overcast: '<path class="i-cloud2" d="M14 27h16a5.5 5.5 0 0 0 .6-11 8.5 8.5 0 0 0-16 2.2A5 5 0 0 0 14 27z"/>' +
-    '<path class="i-cloud" d="M18 38h16a6 6 0 0 0 .6-12 9 9 0 0 0-17 2.4A5.4 5.4 0 0 0 18 38z"/>',
-  drizzle: '<path class="i-cloud" d="M15 28h16a6.2 6.2 0 0 0 .7-12.4 9 9 0 0 0-17.1 2.5A5.5 5.5 0 0 0 15 28z"/>' +
-    '<g class="i-drop"><line x1="19" y1="33" x2="17" y2="39"/><line x1="26" y1="33" x2="24" y2="39"/></g>',
-  rain: '<path class="i-cloud" d="M15 27h16a6.2 6.2 0 0 0 .7-12.4 9 9 0 0 0-17.1 2.5A5.5 5.5 0 0 0 15 27z"/>' +
-    '<g class="i-drop"><line x1="17" y1="32" x2="14" y2="41"/><line x1="24" y1="32" x2="21" y2="41"/><line x1="31" y1="32" x2="28" y2="41"/></g>',
-  storm: '<path class="i-cloud2" d="M14 26h18a6.5 6.5 0 0 0 .7-13 9.5 9.5 0 0 0-18 2.6A5.8 5.8 0 0 0 14 26z"/>' +
-    '<polygon class="i-bolt" points="24,29 18,40 23,40 20,46 30,34 25,34 28,29"/>',
-  snow: '<path class="i-cloud" d="M15 27h16a6.2 6.2 0 0 0 .7-12.4 9 9 0 0 0-17.1 2.5A5.5 5.5 0 0 0 15 27z"/>' +
-    '<g class="i-flake">' + [16, 24, 32].map(x =>
-      `<g transform="translate(${x} 37)"><line x1="-4" y1="0" x2="4" y2="0"/><line x1="0" y1="-4" x2="0" y2="4"/>` +
-      `<line x1="-3" y1="-3" x2="3" y2="3"/><line x1="-3" y1="3" x2="3" y2="-3"/></g>`).join('') + '</g>',
+/* Hand-built SVG on a 64-box so it scales cleanly. */
+const GLYPH = {
+  clear: `<circle cx="32" cy="32" r="12" class="g-sun"/>
+    <g class="g-ray">${[0, 45, 90, 135, 180, 225, 270, 315].map(a =>
+      `<line x1="32" y1="10" x2="32" y2="17" transform="rotate(${a} 32 32)"/>`).join('')}</g>`,
+  partly: `<circle cx="25" cy="25" r="10" class="g-sun"/>
+    <g class="g-ray">${[200, 245, 290].map(a =>
+      `<line x1="25" y1="9" x2="25" y2="14" transform="rotate(${a} 25 25)"/>`).join('')}</g>
+    <path class="g-cloud" d="M26 46h17a8 8 0 0 0 .8-16 11 11 0 0 0-20.9 3A7 7 0 0 0 26 46z"/>`,
+  cloudy: `<path class="g-cloud" d="M21 45h21a8.5 8.5 0 0 0 .9-17 12 12 0 0 0-22.8 3.3A7.5 7.5 0 0 0 21 45z"/>`,
+  overcast: `<path class="g-cloud-hi" d="M18 34h20a7 7 0 0 0 .7-14 10 10 0 0 0-19 2.8A6.2 6.2 0 0 0 18 34z"/>
+    <path class="g-cloud" d="M23 48h20a7.6 7.6 0 0 0 .8-15.2 10.8 10.8 0 0 0-20.5 3A6.8 6.8 0 0 0 23 48z"/>`,
+  drizzle: `<path class="g-cloud" d="M21 38h21a8.5 8.5 0 0 0 .9-17 12 12 0 0 0-22.8 3.3A7.5 7.5 0 0 0 21 38z"/>
+    <g class="g-drop"><line x1="26" y1="44" x2="24" y2="53"/><line x1="36" y1="44" x2="34" y2="53"/></g>`,
+  rain: `<path class="g-cloud" d="M21 36h21a8.5 8.5 0 0 0 .9-17 12 12 0 0 0-22.8 3.3A7.5 7.5 0 0 0 21 36z"/>
+    <g class="g-drop"><line x1="23" y1="42" x2="20" y2="55"/><line x1="32" y1="42" x2="29" y2="55"/>
+      <line x1="41" y1="42" x2="38" y2="55"/></g>`,
+  storm: `<path class="g-cloud-dark" d="M21 34h21a8.5 8.5 0 0 0 .9-17 12 12 0 0 0-22.8 3.3A7.5 7.5 0 0 0 21 34z"/>
+    <path class="g-bolt" d="M32 37l-8 12h6l-3 10 11-14h-7l4-8z"/>
+    <g class="g-drop"><line x1="22" y1="40" x2="19" y2="50"/><line x1="43" y1="40" x2="40" y2="50"/></g>`,
+  snow: `<path class="g-cloud" d="M21 36h21a8.5 8.5 0 0 0 .9-17 12 12 0 0 0-22.8 3.3A7.5 7.5 0 0 0 21 36z"/>
+    <g class="g-flake">${[24, 32, 40].map(x =>
+      `<g transform="translate(${x} 48)"><line x1="-5" y1="0" x2="5" y2="0"/><line x1="0" y1="-5" x2="0" y2="5"/>
+       <line x1="-3.5" y1="-3.5" x2="3.5" y2="3.5"/><line x1="-3.5" y1="3.5" x2="3.5" y2="-3.5"/></g>`).join('')}</g>`,
 };
 
-function icon(text, size = 48) {
-  const k = iconKind(text);
-  return `<svg class="wx-icon wx-${k}" viewBox="0 0 48 48" width="${size}" height="${size}" role="img" aria-label="${text || '天气'}">${ICON[k]}</svg>`;
+/* Decorative by default: the weather phrase is always printed next to the icon. */
+function glyph(text, size) {
+  const k = kindOf(text);
+  return `<svg class="wx wx-${k}" viewBox="0 0 64 64" width="${size}" height="${size}"
+    aria-hidden="true" focusable="false">${GLYPH[k]}</svg>`;
 }
 
-/* ---------- hero ---------- */
-function renderHero() {
-  const m = S.doc.meta, c = S.doc.conclusions, d0 = S.doc.days[0];
-  const seat = seatCell(0);
-  const hero = $('hero');
-  hero.classList.remove('is-loading');
-  hero.dataset.kind = iconKind(seat ? seat.weather : d0.county.weather);
-  hero.innerHTML = `
-    <div class="hero-main">
-      <div class="hero-icon">${icon(seat ? seat.weather : d0.county.weather, 104)}</div>
-      <div class="hero-txt">
-        <div class="hero-place">${m.county || '—'} <span class="hero-seat">${m.seat || ''}</span></div>
-        <div class="hero-temp">${num(seat ? seat.tmax : d0.county.tmax_max)}<span class="deg">℃</span>
-          <span class="hero-lo">/ ${num(seat ? seat.tmin : d0.county.tmin_min)}℃</span></div>
-        <div class="hero-cond">${seat ? seat.weather : d0.county.weather} · ${seat ? seat.wind_text : '—'}</div>
-        <div class="hero-chips">
-          <span class="chip">降水概率 ${seat && seat.pop !== null ? num(seat.pop) + '%' : '—'}</span>
-          <span class="chip">降水时段 ${seat ? seat.windows_text : '—'}</span>
-          <span class="chip">${m.n_townships} 个乡镇</span>
+/* ---------- today ---------- */
+function renderToday() {
+  const box = $('today');
+  const d = S.doc.days[0];
+  const c = seatCell(0);
+  const m = S.doc.meta;
+  if (!d || !c) {
+    box.className = 'today';
+    box.innerHTML = '<p class="boot">没有可用的预报日</p>';
+    return;
+  }
+  const isSeat = c.point === seatId();
+  document.body.dataset.sky = kindOf(c.weather);
+  const pop = pct10(c.pop);
+  const partial = d.hours < 24 ? `<span class="tag">今日仅覆盖 ${d.hours} 小时</span>` : '';
+
+  box.className = 'today ready';
+  box.innerHTML = `
+    <div class="t-left">
+      <h1 class="t-where">${esc(m.county)}<span class="t-sep">·</span>${esc(nameOf(c.point))}${
+        isSeat ? '<span class="t-badge">县城</span>' : ''}</h1>
+      <p class="t-date">${md(d.date)} ${esc(d.weekday)}</p>
+      <div class="t-read">
+        ${glyph(c.weather, 92)}
+        <div class="t-nums">
+          <p class="t-temp"><span class="t-hi">${n1(c.tmax)}</span><span class="t-unit">℃</span></p>
+          <p class="t-lo"><span>最低</span><b>${n1(c.tmin)}℃</b></p>
         </div>
       </div>
+      <p class="t-wx">${esc(c.weather)}<span class="t-wind">${esc(c.wind_text)}</span></p>
     </div>
-    <div class="hero-side">
-      <div class="hero-headline">${c.headline || ''}</div>
-      <dl class="hero-meta">
-        <div><dt>起报</dt><dd>${m.run} UTC</dd></div>
-        <div><dt>成员</dt><dd>${m.member}</dd></div>
-        <div><dt>模式</dt><dd>${(m.sources || []).join(' + ')}</dd></div>
-        <div><dt>集合</dt><dd>${m.pop_members ? m.pop_members + ' 成员' : '未取'}</dd></div>
-        <div><dt>生成</dt><dd>${(m.generated || '').replace('T', ' ').replace('+00:00', 'Z')}</dd></div>
+    <div class="t-right">
+      <p class="t-say">${esc(S.doc.conclusions.headline)}</p>
+      <dl class="t-facts">
+        <div><dt>降水概率</dt><dd>${pop === null ? '—' : pop + '%'}</dd></div>
+        <div><dt>日降水量</dt><dd>${n1(c.precip, 1)}<small> mm</small></dd></div>
+        <div class="wide"><dt>降水时段</dt><dd>${esc(c.windows_text || '—')}</dd></div>
       </dl>
+      <p class="t-src">
+        起报 <b>${esc(m.run)}</b> UTC · 成员 <b>${esc(m.member)}</b>
+        · ${esc((m.sources || []).join(' + '))}${m.pop_members ? ` · GEFS ${m.pop_members} 成员` : ''}
+        · ${m.n_townships} 个乡镇 ${partial}
+      </p>
     </div>`;
 }
 
-function seatCell(dayIdx) {
-  const id = S.doc.conclusions.seat_id;
-  const day = S.doc.days[dayIdx];
-  if (!day) return null;
-  return day.cells.find(c => c.point === id) || day.cells[0] || null;
+/* ---------- alerts: one row per type, a type repeated on four days is one line ---------- */
+function dateList(dates) {
+  return dates.map((x, i) =>
+    (i > 0 && x.slice(5, 7) === dates[i - 1].slice(5, 7)) ? `${Number(x.slice(8, 10))}日` : md(x)).join('、');
 }
-
-/* ---------- alerts ---------- */
-const LEVEL_CLASS = { 红色: 'lv-red', 橙色: 'lv-orange', 黄色: 'lv-yellow', 蓝色: 'lv-blue' };
-
 function renderAlerts() {
   const box = $('alerts');
   const list = S.doc.conclusions.alerts || [];
-  box.innerHTML = '';
-  box.hidden = list.length === 0;
+  if (!list.length) { box.hidden = true; box.innerHTML = ''; return; }
+
+  const byType = new Map();
   for (const a of list) {
-    const n = el('div', `alert-chip ${LEVEL_CLASS[a.level] || 'lv-blue'}`);
-    n.innerHTML = `<span class="dot"></span><span class="alert-tag">${a.type}<i>${a.level}</i></span>`
-      + `<span class="alert-detail">${a.detail}</span>`;
-    box.appendChild(n);
+    const cur = byType.get(a.type);
+    if (!cur) byType.set(a.type, { ...a, dates: [a.date] });
+    else {
+      cur.dates.push(a.date);
+      if ((RANK[a.level] || 0) > (RANK[cur.level] || 0)) { cur.level = a.level; cur.detail = a.detail; }
+    }
   }
+  box.hidden = false;
+  box.innerHTML = [...byType.values()].map(a => `
+    <div class="alert ${ALERT_CLASS[a.level] || 'a-blue'}">
+      <span class="a-type">${esc(a.type)}</span>
+      <span class="a-lvl">${esc(a.level)}</span>
+      <span class="a-what">${esc(String(a.detail || '').replace(/^\d{4}-\d{2}-\d{2}\s*/, ''))}</span>
+      <span class="a-when">${dateList(a.dates)}</span>
+    </div>`).join('');
 }
 
-/* ---------- 5-day strip ---------- */
-function renderDayStrip() {
-  const strip = $('day-strip');
-  strip.innerHTML = '';
-  S.doc.days.forEach((d, i) => {
-    const seat = seatCell(i);
-    const card = el('button', 'day-card');
-    card.type = 'button';
-    if (i === S.dayIdx.table) card.classList.add('is-active');
-    card.dataset.kind = iconKind(seat ? seat.weather : d.county.weather);
-    const partial = d.hours < 24 ? `<span class="day-partial">仅 ${d.hours} h</span>` : '';
-    card.innerHTML = `
-      <div class="day-when"><strong>${d.date.slice(5).replace('-', '月')}日</strong><span>${d.weekday}</span></div>
-      ${icon(seat ? seat.weather : d.county.weather, 52)}
-      <div class="day-wx">${seat ? seat.weather : d.county.weather}</div>
-      <div class="day-temp"><b>${num(seat ? seat.tmax : d.county.tmax_max)}°</b><span>${num(seat ? seat.tmin : d.county.tmin_min)}°</span></div>
-      <div class="day-bars">
-        <span class="day-pop" style="--v:${d.county.pop_max === null ? 0 : d.county.pop_max}%">概率 ${d.county.pop_max === null ? '—' : num(d.county.pop_max) + '%'}</span>
-        <span class="day-rain">雨 ${num(d.county.precip_max, 1)} mm</span>
-      </div>
-      ${partial}`;
-    card.addEventListener('click', () => {
-      S.dayIdx = { temp: i, precip: i, table: i };
-      S.mapDay = i;
-      render();
-      $('days-section').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    });
-    strip.appendChild(card);
-  });
-}
+/* ---------- 5-day rail ---------- */
+function renderDays() {
+  const rail = $('rail');
+  const days = S.doc.days;
+  const lo = Math.min(...days.map(d => d.county.tmin_min).filter(Number.isFinite));
+  const hi = Math.max(...days.map(d => d.county.tmax_max).filter(Number.isFinite));
+  const span = Math.max(hi - lo, 1);
 
-/* ---------- day segmented controls ---------- */
-function renderSegs() {
-  const mk = (host, key, onPick) => {
-    const box = $(host);
-    box.innerHTML = '';
-    S.doc.days.forEach((d, i) => {
-      const b = el('button', 'seg-btn' + (i === S.dayIdx[key] ? ' is-on' : ''));
-      b.type = 'button';
-      b.setAttribute('role', 'tab');
-      b.setAttribute('aria-selected', i === S.dayIdx[key] ? 'true' : 'false');
-      b.textContent = d.date.slice(5);
-      b.addEventListener('click', () => { S.dayIdx[key] = i; onPick(); });
-      box.appendChild(b);
-    });
-  };
-  mk('temp-day-seg', 'temp', () => { renderSegs(); renderTempChart(); });
-  mk('precip-day-seg', 'precip', () => { renderSegs(); renderPrecipChart(); });
-  mk('table-day-seg', 'table', () => { renderSegs(); renderTable(); renderDayStrip(); });
-
-  const mbox = $('map-metric-seg');
-  mbox.innerHTML = '';
-  [['tmax', '最高气温'], ['precip', '降水量'], ['elevation', '海拔'], ['pop', '降水概率']].forEach(([k, label]) => {
-    const b = el('button', 'seg-btn' + (k === S.mapMetric ? ' is-on' : ''));
-    b.type = 'button';
-    b.setAttribute('role', 'tab');
-    b.textContent = label;
-    b.addEventListener('click', () => { S.mapMetric = k; renderSegs(); renderMap(); });
-    mbox.appendChild(b);
-  });
-}
-
-/* ---------- temperature range chart ---------- */
-function renderTempChart() {
-  const day = S.doc.days[S.dayIdx.temp];
-  const host = $('temp-chart');
-  if (!day) { host.innerHTML = ''; return; }
-  const rows = day.cells
-    .map(c => ({ name: nameOf(c.point), lo: c.tmin, hi: c.tmax }))
-    .filter(r => r.lo !== null && r.hi !== null)
-    .sort((a, b) => b.hi - a.hi);
-  if (!rows.length) { host.innerHTML = '<p class="muted">该日无有效数据</p>'; return; }
-
-  const lo = Math.floor(Math.min(...rows.map(r => r.lo)) - 1);
-  const hi = Math.ceil(Math.max(...rows.map(r => r.hi)) + 1);
-  const W = 560, rowH = 24, padL = 84, padR = 44, padT = 26;
-  const H = padT + rows.length * rowH + 12;
-  const x = v => padL + ((v - lo) / (hi - lo)) * (W - padL - padR);
-
-  const ticks = [];
-  const stepT = (hi - lo) > 25 ? 10 : 5;
-  for (let t = Math.ceil(lo / stepT) * stepT; t <= hi; t += stepT) ticks.push(t);
-
-  const bars = rows.map((r, i) => {
-    const y = padT + i * rowH + rowH / 2;
-    const x1 = x(r.lo), x2 = x(r.hi);
-    return `<g class="tr-row">
-      <text class="tr-name" x="${padL - 10}" y="${y + 4}" text-anchor="end">${r.name}</text>
-      <line class="tr-track" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>
-      <line class="tr-bar" x1="${x1}" y1="${y}" x2="${x2}" y2="${y}"/>
-      <circle class="tr-lo" cx="${x1}" cy="${y}" r="4"/>
-      <circle class="tr-hi" cx="${x2}" cy="${y}" r="4"/>
-      <text class="tr-val tr-val-lo" x="${x1 - 8}" y="${y + 4}" text-anchor="end">${num(r.lo)}</text>
-      <text class="tr-val tr-val-hi" x="${x2 + 8}" y="${y + 4}">${num(r.hi)}</text>
-    </g>`;
+  rail.innerHTML = days.map((d, i) => {
+    const wx = d.county.weather || (seatCell(i) || {}).weather || '';
+    const tmax = d.county.tmax_max, tmin = d.county.tmin_min;
+    // Bars share one scale across the week, so its shape reads at a glance.
+    const top = ((hi - tmax) / span) * 100;
+    const bot = ((tmin - lo) / span) * 100;
+    const pop = pct10(d.county.pop_max);
+    const rain = d.county.precip_max ?? 0;
+    return `<button class="day${i === S.day ? ' on' : ''}" type="button" data-day="${i}"
+        aria-pressed="${i === S.day}">
+      <span class="d-dow">${i === 0 ? '今天' : esc(d.weekday)}</span>
+      <span class="d-date">${Number(d.date.slice(5, 7))}/${Number(d.date.slice(8, 10))}</span>
+      ${glyph(wx, 44)}
+      <span class="d-wx">${esc(wx)}</span>
+      <span class="d-bar"><i style="top:${top.toFixed(1)}%;bottom:${bot.toFixed(1)}%;background:${
+        tgrad(tmax, tmin, '180deg')}"></i></span>
+      <span class="d-t"><b>${n1(tmax)}°</b><span>${n1(tmin)}°</span></span>
+      <span class="d-rain">${rain >= 0.1 ? `${n1(rain, 1)} mm` : '无雨'}${pop === null ? '' : ` · ${pop}%`}</span>
+      ${d.hours < 24 ? `<span class="d-part" title="该日只覆盖 ${d.hours} 小时">${d.hours}h</span>` : ''}
+    </button>`;
   }).join('');
 
-  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="svg-chart" role="img"
-      aria-label="${day.date} 各乡镇最低到最高气温区间">
-    <defs><linearGradient id="tgrad" x1="0" x2="1">
-      <stop offset="0" stop-color="var(--cool)"/><stop offset="1" stop-color="var(--warm)"/>
-    </linearGradient></defs>
-    ${ticks.map(t => `<g><line class="tr-grid" x1="${x(t)}" y1="${padT - 12}" x2="${x(t)}" y2="${H - 8}"/>
-      <text class="tr-tick" x="${x(t)}" y="${padT - 16}" text-anchor="middle">${t}℃</text></g>`).join('')}
-    ${bars}
-  </svg>`;
+  rail.querySelectorAll('.day').forEach(b => b.addEventListener('click', () => {
+    S.day = Number(b.dataset.day);
+    renderDays();
+    renderTowns();
+    rail.querySelector(`[data-day="${S.day}"]`).focus();
+  }));
 }
 
-/* ---------- precipitation bar chart ---------- */
-function renderPrecipChart() {
-  const day = S.doc.days[S.dayIdx.precip];
-  const host = $('precip-chart');
-  if (!day) { host.innerHTML = ''; return; }
-  const rows = day.cells
-    .map(c => ({ name: nameOf(c.point), v: c.precip === null ? 0 : c.precip, pop: c.pop }))
-    .sort((a, b) => b.v - a.v);
-  const max = Math.max(1, ...rows.map(r => r.v));
-
-  const W = 560, rowH = 24, padL = 84, padR = 56, padT = 24;
-  const H = padT + rows.length * rowH + 12;
-  const w = v => (v / max) * (W - padL - padR);
-
-  const grades = [[0.1, 'g0'], [10, 'g1'], [25, 'g2'], [50, 'g3'], [100, 'g4']];
-  const gradeOf = v => {
-    let g = 'g0';
-    for (const [cut, cls] of grades) if (v >= cut) g = cls;
-    return g;
-  };
-
-  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="svg-chart" role="img"
-      aria-label="${day.date} 各乡镇日降水量">
-    ${rows.map((r, i) => {
-      const y = padT + i * rowH + 4;
-      const bw = Math.max(r.v > 0 ? 2 : 0, w(r.v));
-      return `<g class="pb-row">
-        <text class="pb-name" x="${padL - 10}" y="${y + 12}" text-anchor="end">${r.name}</text>
-        <rect class="pb-track" x="${padL}" y="${y}" width="${W - padL - padR}" height="15" rx="7.5"/>
-        <rect class="pb-bar ${gradeOf(r.v)}" x="${padL}" y="${y}" width="${bw}" height="15" rx="7.5"/>
-        <text class="pb-val" x="${padL + bw + 8}" y="${y + 12}">${r.v.toFixed(1)}${r.pop !== null ? ` · ${num(r.pop)}%` : ''}</text>
-      </g>`;
-    }).join('')}
-  </svg>
-  <div class="legend">
-    <span class="lg g0">无</span><span class="lg g1">小雨</span><span class="lg g2">中雨</span>
-    <span class="lg g3">大雨</span><span class="lg g4">暴雨</span>
-  </div>`;
-}
-
-/* ---------- township map (equirectangular scatter, cos-lat corrected) ---------- */
-const RAMPS = {
-  tmax: ['#3b82f6', '#22d3ee', '#a3e635', '#fbbf24', '#f97316', '#ef4444'],
-  precip: ['#1e293b', '#0ea5e9', '#22d3ee', '#34d399', '#fbbf24', '#ef4444'],
-  pop: ['#1e293b', '#334155', '#0ea5e9', '#38bdf8', '#7dd3fc', '#e0f2fe'],
-  elevation: ['#14532d', '#3f6212', '#a16207', '#b45309', '#a8a29e', '#f5f5f4'],
-};
-const METRIC_LABEL = { tmax: '最高气温 ℃', precip: '降水量 mm', pop: '降水概率 %', elevation: '海拔 m' };
-
-function lerpColor(a, b, t) {
-  const p = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
-  const [r1, g1, b1] = p(a), [r2, g2, b2] = p(b);
-  const r = Math.round(r1 + (r2 - r1) * t), g = Math.round(g1 + (g2 - g1) * t), bb = Math.round(b1 + (b2 - b1) * t);
-  return `rgb(${r},${g},${bb})`;
-}
-
-function rampColor(ramp, t) {
-  if (!isFinite(t)) return 'var(--muted)';
-  const x = Math.max(0, Math.min(1, t)) * (ramp.length - 1);
-  const i = Math.min(ramp.length - 2, Math.floor(x));
-  return lerpColor(ramp[i], ramp[i + 1], x - i);
-}
-
-function metricValues() {
-  const day = S.doc.days[S.dayIdx.table];
-  const byId = new Map((day ? day.cells : []).map(c => [c.point, c]));
-  return S.doc.townships.map(t => {
-    const c = byId.get(t.id);
-    if (S.mapMetric === 'elevation') return t.elevation;
-    if (!c) return null;
-    return S.mapMetric === 'tmax' ? c.tmax : S.mapMetric === 'precip' ? c.precip : c.pop;
-  });
-}
-
-function renderMap() {
-  const host = $('map');
-  const pts = S.doc.townships;
-  if (!pts.length) { host.innerHTML = ''; return; }
-  const vals = metricValues();
-  const finite = vals.filter(v => v !== null && isFinite(v));
-  let lo = finite.length ? Math.min(...finite) : 0;
-  let hi = finite.length ? Math.max(...finite) : 1;
-  if (hi - lo < 1e-9) { hi = lo + 1; }
-  if (S.mapMetric === 'precip' || S.mapMetric === 'pop') lo = 0;
-
-  const lats = pts.map(p => p.lat), lons = pts.map(p => p.lon);
-  const latMid = (Math.min(...lats) + Math.max(...lats)) / 2;
-  const kx = Math.cos(latMid * Math.PI / 180);           // keep the county's real shape
-  const xs = lons.map(v => v * kx);
-  const pad = 0.035;
-  const x0 = Math.min(...xs) - pad * kx, x1 = Math.max(...xs) + pad * kx;
-  const y0 = Math.min(...lats) - pad, y1 = Math.max(...lats) + pad;
-  const W = 520, H = Math.max(260, Math.round(W * (y1 - y0) / Math.max(1e-9, x1 - x0)));
-  const px = v => ((v * kx - x0) / (x1 - x0)) * W;
-  const py = v => H - ((v - y0) / (y1 - y0)) * H;
-
-  const ramp = RAMPS[S.mapMetric];
-  const marks = pts.map((p, i) => {
-    const v = vals[i];
-    const t = v === null || !isFinite(v) ? NaN : (v - lo) / (hi - lo);
-    const r = 9 + (isFinite(t) ? t * 5 : 0);
-    return `<g class="mp" tabindex="0" role="button" data-id="${p.id}"
-        aria-label="${p.name} ${METRIC_LABEL[S.mapMetric]} ${v === null ? '无数据' : num(v)}">
-      <circle class="mp-halo" cx="${px(p.lon).toFixed(1)}" cy="${py(p.lat).toFixed(1)}" r="${(r + 6).toFixed(1)}"/>
-      <circle class="mp-dot" cx="${px(p.lon).toFixed(1)}" cy="${py(p.lat).toFixed(1)}" r="${r.toFixed(1)}"
-              fill="${rampColor(ramp, t)}"/>
-      <text class="mp-lbl" x="${px(p.lon).toFixed(1)}" y="${(py(p.lat) - r - 6).toFixed(1)}"
-            text-anchor="middle">${p.name}</text>
-      <text class="mp-num" x="${px(p.lon).toFixed(1)}" y="${(py(p.lat) + 4).toFixed(1)}"
-            text-anchor="middle">${v === null || !isFinite(v) ? '–' : num(v)}</text>
-    </g>`;
-  }).join('');
-
-  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="svg-map" role="group"
-      aria-label="乡镇分布，按${METRIC_LABEL[S.mapMetric]}着色">${marks}</svg>`;
-  host.querySelectorAll('.mp').forEach(g => {
-    const open = () => openDrawer(g.dataset.id);
-    g.addEventListener('click', open);
-    g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  });
-
-  const stops = RAMPS[S.mapMetric].map((c, i, a) =>
-    `<stop offset="${(i / (a.length - 1) * 100).toFixed(0)}%" stop-color="${c}"/>`).join('');
-  $('map-legend').innerHTML = `<span class="muted">${METRIC_LABEL[S.mapMetric]}</span>
-    <svg class="legend-bar" viewBox="0 0 200 12" preserveAspectRatio="none" aria-hidden="true">
-      <defs><linearGradient id="lgrad" x1="0" x2="1">${stops}</linearGradient></defs>
-      <rect x="0" y="0" width="200" height="12" rx="6" fill="url(#lgrad)"/>
-    </svg>
-    <span class="muted">${num(lo)} → ${num(hi)}</span>
-    <span class="muted legend-day">${S.doc.days[S.dayIdx.table] ? S.doc.days[S.dayIdx.table].date : ''}</span>`;
-}
-
-/* ---------- township detail table ---------- */
-function renderTable() {
-  const day = S.doc.days[S.dayIdx.table];
-  const tbl = $('town-table');
-  if (!day) { tbl.innerHTML = ''; return; }
+/* ---------- townships, ordered by elevation ----------
+ * A 28 km model cell is one number; the lapse-rate correction is what separates
+ * a 590 m village from a 56 m one. Rows go high -> low and the temperature bars
+ * share one scale, so the cooling with height is visible without reading digits.
+ * The header row uses the same 7-column grid as the rows, so its temperature
+ * legend sits exactly above the bars. */
+function renderTowns() {
+  const d = S.doc.days[S.day];
+  if (!d) return;
   const byId = new Map(S.doc.townships.map(t => [t.id, t]));
-  const tmaxes = day.cells.map(c => c.tmax).filter(v => v !== null && isFinite(v));
-  const lo = Math.min(...tmaxes), hi = Math.max(...tmaxes);
-  const rows = day.cells.map(c => {
-    const t = byId.get(c.point) || { name: c.point, elevation: null };
-    const heat = tmaxes.length && hi > lo ? (c.tmax - lo) / (hi - lo) : 0;
-    return `<tr tabindex="0" data-id="${c.point}">
-      <th scope="row">${t.name}</th>
-      <td class="num">${t.elevation === null ? '–' : Math.round(t.elevation)}</td>
-      <td>${c.weather}</td>
-      <td class="num t-cell" style="--heat:${rampColor(RAMPS.tmax, heat)}">
-        ${num(c.tmin, 0)}～${num(c.tmax, 0)}</td>
-      <td class="num">${num(c.precip, 1)}</td>
-      <td class="num">${c.pop === null ? '–' : Math.round(c.pop / 10) * 10 + '%'}</td>
-      <td>${c.wind_text}</td>
-      <td class="win">${c.windows_text}</td>
-    </tr>`;
+  const sid = seatId();
+  const rows = d.cells
+    .map(c => ({ c, t: byId.get(c.point) }))
+    .filter(r => r.t)
+    .sort((a, b) => (b.t.elevation ?? 0) - (a.t.elevation ?? 0));
+
+  const temps = rows.flatMap(r => [r.c.tmin, r.c.tmax]).filter(Number.isFinite);
+  const lo = Math.floor(Math.min(...temps)), hi = Math.ceil(Math.max(...temps));
+  const span = Math.max(hi - lo, 1);
+  // Rain bars: at least a 10 mm scale, so 0.3 mm of drizzle stays a sliver
+  // instead of filling the bar on a dry day.
+  const rainTop = Math.max(10, ...rows.map(r => r.c.precip ?? 0));
+
+  $('towns-when').textContent =
+    `${md(d.date)} ${d.weekday}${d.hours < 24 ? `（仅覆盖 ${d.hours} 小时）` : ''} · 按海拔从高到低`;
+
+  const head = `<div class="town town-head" aria-hidden="true">
+      <span class="r-name">乡镇</span>
+      <span class="r-alt">海拔</span>
+      <span class="r-wx">天气</span>
+      <span class="r-scale"><span class="r-track">
+        <b class="h-lo">${lo}°</b><i class="h-grad" style="background:${tgrad(lo, hi, '90deg')}"></i><b class="h-hi">${hi}°</b>
+      </span></span>
+      <span class="r-rain">降水 mm</span>
+      <span class="r-pop">概率</span>
+      <span class="r-wind">风</span>
+    </div>`;
+
+  const body = rows.map(({ c, t }) => {
+    const left = ((c.tmin - lo) / span) * 100;
+    const width = Math.max(((c.tmax - c.tmin) / span) * 100, 2);
+    const rain = c.precip ?? 0;
+    const rainW = rain >= 0.05 ? Math.max((rain / rainTop) * 100, 3) : 0;
+    const pop = pct10(c.pop);
+    const seat = t.id === sid;
+    const label = `${t.name}${seat ? '（县城）' : ''}，海拔 ${n1(t.elevation)} 米，${c.weather}，` +
+      `${n1(c.tmin)} 到 ${n1(c.tmax)} 摄氏度，降水 ${n1(rain, 1)} 毫米` +
+      `${pop === null ? '' : `，概率 ${pop}%`}，${c.wind_text}`;
+    return `<button class="town${seat ? ' is-seat' : ''}" type="button" data-id="${esc(t.id)}"
+        aria-label="${esc(label)}">
+      <span class="r-name">${esc(t.name)}${seat ? '<i class="r-seat">县城</i>' : ''}</span>
+      <span class="r-alt">${n1(t.elevation)}<i>m</i></span>
+      <span class="r-wx">${glyph(c.weather, 24)}<em>${esc(c.weather)}</em></span>
+      <span class="r-scale"><span class="r-track">
+        <i class="r-span" style="left:${left.toFixed(1)}%;width:${width.toFixed(1)}%;background:${
+          tgrad(c.tmin, c.tmax, '90deg')}"></i>
+        <b class="r-lo" style="left:${left.toFixed(1)}%">${n1(c.tmin)}</b>
+        <b class="r-hi" style="left:${(left + width).toFixed(1)}%">${n1(c.tmax)}</b>
+      </span></span>
+      <span class="r-rain"><span class="r-bar"><i style="width:${rainW.toFixed(1)}%"></i></span>
+        <em>${rain >= 0.05 ? n1(rain, 1) : '—'}</em></span>
+      <span class="r-pop">${pop === null ? '—' : `${pop}%`}</span>
+      <span class="r-wind">${esc(c.wind_text)}</span>
+    </button>`;
   }).join('');
-  tbl.innerHTML = `<caption class="sr-only">${day.date} 各乡镇预报明细</caption>
-    <thead><tr>
-      <th scope="col">乡镇</th><th scope="col">海拔m</th><th scope="col">天气</th>
-      <th scope="col">气温℃</th><th scope="col">降水mm</th><th scope="col">概率</th>
-      <th scope="col">风</th><th scope="col">降水时段</th>
-    </tr></thead><tbody>${rows}</tbody>`;
-  tbl.querySelectorAll('tbody tr').forEach(tr => {
-    const open = () => openDrawer(tr.dataset.id);
-    tr.addEventListener('click', open);
-    tr.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); open(); } });
-  });
+
+  $('towns').innerHTML = head + body;
+  $('towns').querySelectorAll('button.town').forEach(b =>
+    b.addEventListener('click', () => openSheet(b.dataset.id, b)));
 }
 
-/* ---------- drawer: one township, all days ---------- */
-function openDrawer(pointId) {
-  const t = S.doc.townships.find(x => x.id === pointId);
+/* ---------- township sheet ---------- */
+function openSheet(id, from) {
+  const t = S.doc.townships.find(x => x.id === id);
   if (!t) return;
-  const rows = S.doc.days.map(d => {
-    const c = d.cells.find(x => x.point === pointId);
+  const dz = (t.elevation ?? 0) - (t.model_elevation ?? 0);
+  const corr = -dz * 0.0065;
+
+  const rows = S.doc.days.map((d, i) => {
+    const c = d.cells.find(x => x.point === id);
     if (!c) return '';
-    return `<tr>
-      <th scope="row">${d.date.slice(5)}<small>${d.weekday}</small></th>
-      <td class="ic">${icon(c.weather, 26)}</td>
-      <td>${c.weather}</td>
-      <td class="num">${num(c.tmin, 0)}～${num(c.tmax, 0)}℃</td>
-      <td class="num">${num(c.precip, 1)}mm</td>
-      <td class="num">${c.pop === null ? '–' : Math.round(c.pop / 10) * 10 + '%'}</td>
-      <td>${c.wind_text}</td>
-      <td class="win">${c.windows_text}</td>
+    const pop = pct10(c.pop);
+    return `<tr${i === S.day ? ' class="on"' : ''}>
+      <th scope="row"><b>${i === 0 ? '今天' : esc(d.weekday)}</b><span>${md(d.date)}</span></th>
+      <td class="s-wx">${glyph(c.weather, 24)}<span>${esc(c.weather)}</span></td>
+      <td class="s-t"><b>${n1(c.tmax)}°</b><span>${n1(c.tmin)}°</span></td>
+      <td class="s-num">${(c.precip ?? 0) >= 0.05 ? `${n1(c.precip, 1)} mm` : '—'}</td>
+      <td class="s-num">${pop === null ? '—' : `${pop}%`}</td>
+      <td class="s-wind">${esc(c.wind_text)}</td>
+      <td class="s-win">${esc(c.windows_text || '—')}</td>
     </tr>`;
   }).join('');
-  $('drawer-body').innerHTML = `
-    <header class="drawer-head">
-      <div>
-        <h3>${t.name}</h3>
-        <p class="muted">海拔 ${t.elevation === null ? '–' : Math.round(t.elevation)} m
-          · 模式地形 ${t.model_elevation === null ? '–' : Math.round(t.model_elevation)} m
-          · ${t.lat.toFixed(4)}°N ${t.lon.toFixed(4)}°E</p>
-      </div>
-    </header>
-    <div class="table-wrap"><table class="drawer-table"><tbody>${rows}</tbody></table></div>
-    <p class="muted fine">气温已按 ${t.elevation === null ? '' : Math.round(t.elevation)} m
-      与模式地形高差做递减率订正（−6.5 K/km）。</p>`;
-  const d = $('drawer');
-  d.hidden = false;
-  requestAnimationFrame(() => d.classList.add('open'));
-  $('drawer-close').focus();
+
+  $('sheet-body').innerHTML = `
+    <h3 id="sheet-title" class="s-title">${esc(t.name)}</h3>
+    <p class="s-meta">海拔 <b>${n1(t.elevation)} m</b> · 模式地形 ${n1(t.model_elevation)} m
+      · ${Number(t.lat).toFixed(3)}°N ${Number(t.lon).toFixed(3)}°E</p>
+    <p class="s-note">比模式地形${dz >= 0 ? '高' : '低'} ${n1(Math.abs(dz))} m，按 −6.5 K/km 递减率，气温订正约 ${
+      corr >= 0 ? '+' : '−'}${n1(Math.abs(corr), 1)} K。</p>
+    <div class="s-wrap"><table class="s-table">
+      <thead><tr><th scope="col">日期</th><th scope="col">天气</th><th scope="col">气温</th>
+        <th scope="col">降水</th><th scope="col">概率</th><th scope="col">风</th><th scope="col">降水时段</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+
+  S.back = from || document.activeElement;
+  const sheet = $('sheet');
+  sheet.hidden = false;
+  document.body.classList.add('lock');
+  requestAnimationFrame(() => sheet.classList.add('on'));
+  $('sheet-close').focus();
 }
 
-function closeDrawer() {
-  const d = $('drawer');
-  d.classList.remove('open');
-  setTimeout(() => { d.hidden = true; }, 200);
+function closeSheet() {
+  const sheet = $('sheet');
+  if (sheet.hidden) return;
+  sheet.classList.remove('on');
+  document.body.classList.remove('lock');
+  setTimeout(() => { sheet.hidden = true; }, 180);
+  if (S.back && document.contains(S.back)) S.back.focus();
+  S.back = null;
 }
 
-/* ---------- bulletin text + API docs ---------- */
+/* Keep Tab inside the dialog while it is open. */
+function trapFocus(e) {
+  if (e.key !== 'Tab' || $('sheet').hidden) return;
+  const f = [...$('sheet').querySelectorAll('button, [href], [tabindex]:not([tabindex="-1"])')];
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+/* ---------- bulletin text + API reference (both collapsed by default) ---------- */
 function renderText() {
-  $('bulletin-text').textContent = S.doc.text || '（无文稿）';
+  $('doc-text').textContent = S.doc.text || '';
 }
 
-const API_DOCS = [
-  ['GET', '/api/latest', '最新一次产品的完整 JSON：meta、逐日县级摘要、逐乡镇明细、结论、文稿'],
-  ['GET', '/api/summary', '仅 meta + 结论 + 逐日县级摘要，体积小，适合看板轮询'],
-  ['GET', '/api/runs', '已存起报时次索引，最新在前'],
-  ['GET', '/api/runs/{file}', '按索引里的 file 取某一次历史产品'],
-  ['GET', '/api/townships', '乡镇名录：id、名称、经纬度、海拔'],
-  ['GET', '/api/health', '存活探针：产品数量与最新起报时次'],
+const ENDPOINTS = [
+  ['/api/latest', '最新产品全量：每日每乡镇的天气、气温、降水、概率、风、降水时段'],
+  ['/api/summary', '仅摘要：起报信息、结论、每日县级极值（体积小，适合轮询）'],
+  ['/api/runs', '历史起报时次索引，新到旧'],
+  ['/api/runs/{file}', '按索引里的 file 字段取某一次起报的完整产品'],
+  ['/api/townships', '乡镇名录：id、名称、经纬度、海拔'],
+  ['/api/health', '健康检查：已存时次数量与最新时次'],
 ];
 
 function renderApi() {
-  $('api-list').innerHTML = API_DOCS.map(([m, path, desc]) => `
-    <div class="api-row">
-      <code class="api-path"><span class="verb">${m}</span>${path}</code>
-      <span class="muted">${desc}</span>
-      <button class="ghost-btn copy-api" data-path="${path}">复制</button>
-    </div>`).join('');
-  $('api-list').querySelectorAll('.copy-api').forEach(b => {
-    b.addEventListener('click', () => {
-      copy(location.origin + b.dataset.path.replace('{file}', ''), b);
-    });
+  const first = S.runs[0] ? encodeURIComponent(S.runs[0].file) : null;
+  $('api-list').innerHTML = ENDPOINTS.map(([path, desc]) => {
+    const href = path.includes('{file}') ? (first ? path.replace('{file}', first) : null) : path;
+    return `<div class="ep">
+      <code>GET ${esc(path)}</code>
+      <span>${esc(desc)}</span>
+      ${href ? `<a href="${esc(href)}" target="_blank" rel="noopener">打开</a>` : '<span></span>'}
+    </div>`;
+  }).join('');
+  $('api-curl').textContent = `curl -s ${location.origin}/api/summary | python3 -m json.tool`;
+}
+
+/* ---------- run picker ---------- */
+function renderRuns() {
+  const sel = $('runs');
+  if (!S.runs.length) { sel.hidden = true; return; }
+  sel.hidden = false;
+  sel.innerHTML = S.runs.map(r =>
+    `<option value="${esc(r.file)}"${r.run === S.doc.meta.run ? ' selected' : ''}>${esc(r.run)} UTC 起报</option>`).join('');
+}
+
+async function pickRun(file) {
+  const sel = $('runs');
+  sel.disabled = true;
+  try {
+    S.doc = await api(`/api/runs/${encodeURIComponent(file)}`);
+    S.names = null;  // the roster belongs to the previous run
+    S.day = 0;
+    paint();
+  } catch (err) {
+    fail(err.message);
+  }
+  sel.disabled = false;
+}
+
+/* ---------- wiring ---------- */
+function bjTime(iso) {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return iso || '—';
+  return t.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
   });
 }
 
-async function copy(text, btn) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement('textarea');
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    document.execCommand('copy'); ta.remove();
-  }
-  const old = btn.textContent;
-  btn.textContent = '已复制';
-  setTimeout(() => { btn.textContent = old; }, 1200);
-}
-
-/* ---------- render-all + boot ---------- */
-function renderAll() {
-  renderHero();
+function paint() {
+  renderToday();
   renderAlerts();
-  renderDayStrip();
-  renderSegs();
-  renderTempChart();
-  renderPrecipChart();
-  renderMap();
-  renderTable();
+  renderDays();
+  renderTowns();
   renderText();
-  renderFooter();
-}
-
-function renderFooter() {
+  renderApi();
+  renderRuns();
   const m = S.doc.meta;
-  $('foot-meta').textContent =
-    `起报 ${m.run} · 生成 ${(m.generated || '').replace('T', ' ').replace('+00:00', 'Z')} · ${m.n_townships} 个乡镇`;
+  $('foot').innerHTML =
+    `<span>${esc(m.county)} · ${esc(m.run)} UTC 起报 · 生成于 ${esc(bjTime(m.generated))} 北京时</span>` +
+    `<span>数据：ECMWF 开放数据、NOAA GFS/GEFS · 自动生成，仅供参考</span>`;
 }
 
-function wireStatic() {
-  // theme button is wired in initTheme()
-  $('copy-text').addEventListener('click', () => copy(S.doc.text || '', $('copy-text')));
-  $('drawer-close').addEventListener('click', closeDrawer);
-  $('drawer').addEventListener('click', e => { if (e.target.id === 'drawer') closeDrawer(); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('drawer').hidden) closeDrawer(); });
-  window.addEventListener('resize', debounce(() => {
-    if (S.doc) { renderTempChart(); renderPrecipChart(); renderMap(); }
-  }, 180));
+function wire() {
+  $('runs').addEventListener('change', e => pickRun(e.target.value));
+  $('sheet-close').addEventListener('click', closeSheet);
+  $('sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
+  $('copy-doc').addEventListener('click', copyDoc);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeSheet();
+    trapFocus(e);
+  });
 }
 
-function debounce(fn, ms) {
-  let h; return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); };
+async function copyDoc() {
+  const btn = $('copy-doc');
+  const was = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(S.doc.text || '');
+    btn.textContent = '已复制';
+  } catch {
+    btn.textContent = '复制失败';
+  }
+  setTimeout(() => { btn.textContent = was; }, 1400);
+}
+
+function fail(msg) {
+  const box = $('today');
+  box.className = 'today';
+  box.innerHTML = `<div class="empty">
+    <h2>还没有预报产品</h2>
+    <p>定时任务尚未产出第一份预报，或数据目录为空。手动生成一次：</p>
+    <pre>python3 -m wxgrid publish --townships yanshan_townships.csv \\
+  --county 铅山县 --seat 河口镇 --data-dir /var/lib/wxgrid</pre>
+    <p class="dim">${esc(String(msg || ''))}</p></div>`;
+}
+
+async function boot() {
+  initTheme();
+  wire();
+  try {
+    S.doc = await api('/api/latest');
+  } catch (err) {
+    return fail(err.message);
+  }
+  try {
+    S.runs = await api('/api/runs');
+  } catch {
+    S.runs = [];
+  }
+  paint();
 }
 
 boot();

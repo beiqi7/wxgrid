@@ -165,7 +165,7 @@ def conclusions(days: list[dict], *, county: str, seat: str, seat_id: str | None
     """Deterministic county conclusions: a headline plus typed alerts."""
     alerts: list[dict[str, Any]] = []
     if not days:
-        return {"headline": "无有效预报", "alerts": alerts}
+        return {"headline": "无有效预报", "alerts": alerts, "seat_id": seat_id}
 
     tmaxes = [d["county"]["tmax_max"] for d in days if d["county"]["tmax_max"] is not None]
     tmins = [d["county"]["tmin_min"] for d in days if d["county"]["tmin_min"] is not None]
@@ -213,7 +213,8 @@ def conclusions(days: list[dict], *, county: str, seat: str, seat_id: str | None
     if alerts:
         kinds = sorted({a["type"] for a in alerts})
         parts.append("注意" + "、".join(kinds))
-    return {"headline": "，".join(parts) + "。", "alerts": alerts}
+    # seat_id lets clients pick the county seat's cell without matching on names.
+    return {"headline": "，".join(parts) + "。", "alerts": alerts, "seat_id": seat_id}
 
 
 def to_bulletin_text(daily, halves, windows, *, county, seat, run, member, days, tz,

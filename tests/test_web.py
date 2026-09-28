@@ -90,6 +90,13 @@ def test_product_keeps_gust_so_bulletin_can_report_it():
     assert "阵风" in doc["text"]
 
 
+def test_conclusions_name_the_seat_township():
+    """Regression: seat_id was computed but dropped, so the web hero fell back to
+    the first township in the roster instead of the county seat."""
+    doc = _product()
+    assert doc["conclusions"]["seat_id"] == "A"  # seat="甲镇" -> id "A"
+
+
 def test_rain_alert_fires_on_a_heavy_day():
     rate = np.zeros(len(STEPS))
     rate[8:16] = 9.0  # ~72 mm inside one local day
@@ -192,3 +199,18 @@ def test_static_assets_revalidate_instead_of_going_stale(server):
 def test_unknown_route_is_404(server):
     base, _ = server
     assert _status(f"{base}/api/nope") == 404
+
+
+def test_every_id_the_ui_script_uses_exists_in_the_page():
+    """Regression: app.js and index.html drifted apart during the UI rewrite and
+    the page rendered blank because getElementById returned null."""
+    import re
+    static = pathlib.Path(webapp.__file__).parent / "static"
+    js = (static / "app.js").read_text(encoding="utf-8")
+    html = (static / "index.html").read_text(encoding="utf-8")
+    used = set(re.findall(r"\$\('([\w-]+)'\)", js))
+    have = set(re.findall(r'id="([\w-]+)"', html))
+    # ids the script creates itself (inside innerHTML templates) are fine too
+    have |= set(re.findall(r'id="([\w-]+)"', js))
+    assert used, "no $('id') lookups found; the regex no longer matches app.js"
+    assert used <= have, f"app.js looks up ids missing from index.html: {sorted(used - have)}"

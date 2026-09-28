@@ -51,6 +51,12 @@ systemctl enable --now wxgrid-web.service wxgrid-publish.timer
 
 两个单元都开了 `ProtectSystem=strict`；publish 仅可写 `/var/lib/wxgrid`，web 对它只读。
 
+## Web 页面
+
+单页、无构建、无 CDN（`wxgrid/web/static/`）。自上而下：县城今日 → 预警 → 未来五天（点某天切换）→
+各乡镇按海拔从高到低排列、气温条共用一条色标（看得出高山更凉）→ 点乡镇看五天详情 → 折叠的文稿与接口说明。
+日/夜主题存在 `localStorage`。页面只读 `/api/latest` 和 `/api/runs`，可在顶栏切换历史起报时次。
+
 ## 只读 API
 
 无鉴权，只读，`Access-Control-Allow-Origin: *`。当前绑 `0.0.0.0:8790`，公网可达。
@@ -80,7 +86,7 @@ days[]       date, weekday, hours(覆盖小时), county{tmax_max,tmin_min,...,we
              wind_text/wind_dir/wind_dir_name/wind_speed/wind_speed_max/wind_gust,
              windows(本地小时区间), windows_text
 townships[]  id, name, lat, lon, elevation, model_elevation
-conclusions  headline, alerts[]{type,level,date,detail}
+conclusions  headline, alerts[]{type,level,date,detail}, seat_id(县城乡镇 id，找不到时为 null)
 text         与 CLI 一致的文字预报全文
 ```
 
