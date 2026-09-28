@@ -5,7 +5,7 @@
 
 - 代码：`/opt/wxgrid`
 - 数据：`/var/lib/wxgrid`（产品 JSON + GRIB 缓存，不进 git）
-- 页面/API：`http://127.0.0.1:8790`
+- 页面/API：`http://<服务器地址>:8790`（对外开放，见下方「安全」）
 
 ## 快速开始
 
@@ -24,7 +24,7 @@ python3 -m wxgrid publish --townships yanshan_townships.csv \
     --county 铅山县 --seat 河口镇 --data-dir /var/lib/wxgrid
 
 # 4. 起服务
-python3 -m wxgrid serve --host 127.0.0.1 --port 8790 --data-dir /var/lib/wxgrid
+python3 -m wxgrid serve --host 0.0.0.0 --port 8790 --data-dir /var/lib/wxgrid
 ```
 
 ## 部署
@@ -53,8 +53,9 @@ systemctl enable --now wxgrid-web.service wxgrid-publish.timer
 
 ## 只读 API
 
-无鉴权，只读，`Access-Control-Allow-Origin: *`。默认绑 127.0.0.1——
-要对外暴露请走现有反向代理（TLS + 访问控制），不要直接改成 `0.0.0.0`。
+无鉴权，只读，`Access-Control-Allow-Origin: *`。当前绑 `0.0.0.0:8790`，公网可达。
+进程跑在 `ProtectSystem=strict` + `ReadOnlyPaths` 下，写不了任何东西，数据目录也无密钥，
+所以最坏情况是数据被免费取用，不会被篡改。正式对外建议挂到现有反代加 TLS 与限流。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -66,8 +67,8 @@ systemctl enable --now wxgrid-web.service wxgrid-publish.timer
 | GET | `/api/townships` | 乡镇名录：id、名称、经纬度、海拔 |
 
 ```bash
-curl -s http://127.0.0.1:8790/api/summary | python3 -m json.tool
-curl -s http://127.0.0.1:8790/api/latest | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["conclusions"]["headline"])'
+curl -s http://localhost:8790/api/summary | python3 -m json.tool
+curl -s http://localhost:8790/api/latest | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["conclusions"]["headline"])'
 ```
 
 ### 产品 JSON 结构
@@ -125,4 +126,5 @@ cd /opt/wxgrid && python3 -m pytest tests -q
   若 GEFS 落后，最后一天的概率可能只被部分时段覆盖。
 - `--tz` 只支持整小时偏移（内部按整小时取整）。
 - 融合风速由加权后的 u/v 求模，成员风向分歧大时会略低于成员风速的加权平均。
-- API 无鉴权，默认只绑回环。
+- API 无鉴权且绑 `0.0.0.0:8790`，公网可读全部预报数据（只读，无法篡改）。
+- 内置 HTTP 服务是 Python `http.server`，够用但不抗高并发，正式对外建议走反代。
