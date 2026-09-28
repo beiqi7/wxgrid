@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>乡镇天气预报</title>
-<meta name="description" content="乡镇级精细化天气预报：ECMWF IFS + NOAA GFS 降尺度，GEFS 集合降水概率">
+<meta name="description" content="乡镇级精细化天气预报：ECMWF IFS + NOAA GFS 降尺度融合，逐时与逐日，GEFS 集合降水概率">
 <link rel="icon" href="/static/favicon.svg">
 <link rel="stylesheet" href="/static/styles.css">
 <!-- apply the saved theme before first paint so night mode does not flash white -->
@@ -12,6 +12,7 @@
 </head>
 <body>
 <div class="sky" aria-hidden="true"></div>
+<a class="skip" href="#h-hourly">跳到逐时预报</a>
 
 <header class="bar">
   <div class="bar-in">
@@ -20,6 +21,12 @@
       <span class="mark-txt">wxgrid</span>
       <span class="mark-sub">乡镇精细化预报</span>
     </a>
+    <nav class="nav" aria-label="页面导航">
+      <a href="#h-hourly">逐时</a>
+      <a href="#h-days">五天</a>
+      <a href="#h-towns">乡镇</a>
+      <a href="#h-method">方法</a>
+    </nav>
     <div class="bar-right">
       <select id="runs" class="runs" aria-label="选择起报时次" hidden></select>
       <button id="theme" class="theme-btn" type="button"></button>
@@ -36,7 +43,31 @@
   <!-- 2. alerts -->
   <section id="alerts" class="alerts" aria-label="预警提示" hidden></section>
 
-  <!-- 3. five days -->
+  <!-- 3. hourly, any township -->
+  <section class="band" aria-labelledby="h-hourly">
+    <div class="bhead">
+      <h2 id="h-hourly" class="btitle">逐时预报</h2>
+      <p id="hr-sub" class="bsub"></p>
+      <label class="pick">
+        <span>乡镇</span>
+        <select id="hr-town" aria-label="选择乡镇查看逐时预报"></select>
+      </label>
+    </div>
+    <div class="panel">
+      <div id="hr-days" class="chips" aria-label="跳到某一天"></div>
+      <div id="hr-chart" class="hr-host"></div>
+      <p class="legend">
+        <span><i class="lg-line"></i>气温 ℃</span>
+        <span><i class="lg-bar"></i>降水 mm（该时刻前 1 小时）</span>
+        <span><b class="lg-pop">%</b>降水概率（所在 6 小时时段）</span>
+        <span><b class="lg-arrow">➤</b>风力，箭头指向风的去向</span>
+        <span><i class="lg-night"></i>夜间</span>
+      </p>
+      <div id="hr-table"></div>
+    </div>
+  </section>
+
+  <!-- 4. five days -->
   <section class="band" aria-labelledby="h-days">
     <div class="bhead">
       <h2 id="h-days" class="btitle">未来五天</h2>
@@ -45,17 +76,103 @@
     <div id="rail" class="rail" aria-label="选择日期"></div>
   </section>
 
-  <!-- 4. townships, the actual product -->
+  <!-- 5. townships, the actual product -->
   <section class="band" aria-labelledby="h-towns">
     <div class="bhead">
       <h2 id="h-towns" class="btitle">各乡镇</h2>
       <p id="towns-when" class="bsub"></p>
     </div>
     <div id="towns" class="towns"></div>
-    <p class="note">气温已按 −6.5 K/km 递减率从模式地形订正到乡镇实际海拔，所以同一天高山乡镇更凉。点一行看该乡镇五天详情。</p>
+    <p class="note">气温已按 −6.5 K/km 递减率从模式地形订正到乡镇实际海拔，所以同一天高山乡镇更凉。点一行看该乡镇的逐时与五天详情。</p>
   </section>
 
-  <!-- 5. secondary material, folded -->
+  <!-- 6. models and method -->
+  <section class="band" aria-labelledby="h-method">
+    <div class="bhead">
+      <h2 id="h-method" class="btitle">模型与方法</h2>
+      <p class="bsub">这份预报从哪来、怎么算、哪里靠不住</p>
+    </div>
+
+    <div class="sources">
+      <article class="src">
+        <p class="src-tag">确定性 · 权重 <b id="w-ec">0.6</b></p>
+        <h3>ECMWF IFS</h3>
+        <p class="src-spec">0.25° 约 28 km · 3 小时一步</p>
+        <p>欧洲中期天气预报中心的全球模式，公认中期预报技巧最高。取开放数据的 00/12 时（UTC）起报。</p>
+      </article>
+      <article class="src">
+        <p class="src-tag">确定性 · 权重 <b id="w-gfs">0.4</b></p>
+        <h3>NOAA GFS</h3>
+        <p class="src-spec">0.25° 约 28 km · 逐时至 120 小时</p>
+        <p>美国国家环境预报中心的全球模式。与 IFS 同化、物理过程不同，误差互补；逐时输出同时提供日内变化形态。</p>
+      </article>
+      <article class="src">
+        <p class="src-tag">集合 · <b id="w-mem">21</b> 个成员</p>
+        <h3>NOAA GEFS</h3>
+        <p class="src-spec">0.5° · 6 小时降水</p>
+        <p>同一模式扰动初值跑 21 次。降水概率 = 有 ≥0.1 mm 降水的成员占比，不做任何拟合。</p>
+      </article>
+      <article class="src">
+        <p class="src-tag">地形</p>
+        <h3>Copernicus DEM</h3>
+        <p class="src-spec">GLO-30 · 约 30 m</p>
+        <p>欧空局全球数字高程。给每个乡镇政府驻地取真实海拔，用来订正模式地形带来的气温偏差。</p>
+      </article>
+    </div>
+
+    <ol class="steps">
+      <li><b>取数</b><span>按 GRIB 索引只取本县周边、所需的约 10 个地面要素，每个时次几 MB，而不是整份 500 MB 文件。</span></li>
+      <li><b>降尺度</b><span>双线性插值到乡镇坐标；气温按递减率从模式地形订正到实际海拔，风和降水不做地形假设。</span></li>
+      <li><b>融合</b><span>两家模式各自降尺度到乡镇后再加权，避免在粗网格上混合抹掉海拔信号；风向由融合后的 u/v 重算。</span></li>
+      <li><b>逐时化</b><span>3 小时融合值定基准，GFS 逐时曲线定形态；降水按 GFS 逐时占比分配，3 小时总量严格守恒。</span></li>
+      <li><b>概率</b><span>GEFS 各成员的 6 小时降水按时段、按北京时自然日统计有雨成员比例。</span></li>
+      <li><b>成文</b><span>北京时切日、08/20 时分昼夜；降水、风力、云量按国标用语写出县城与分乡镇预报和预警提示。</span></li>
+    </ol>
+
+    <div class="formulas">
+      <figure class="fx">
+        <figcaption>气温海拔订正</figcaption>
+        <p class="eq">T<sub>乡镇</sub> = T<sub>格点</sub> + γ · (z<sub>乡镇</sub> − z<sub>格点</sub>)</p>
+        <p class="fx-note">γ = −6.5 K/km（标准大气递减率），订正幅度上限 ±10 K。高于模式地形的乡镇降温，低于的升温。</p>
+      </figure>
+      <figure class="fx">
+        <figcaption>多模式融合</figcaption>
+        <p class="eq">X = <span id="f-wec">0.6</span> · X<sub>ECMWF</sub> + <span id="f-wgfs">0.4</span> · X<sub>GFS</sub></p>
+        <p class="fx-note">对气温、降水、云量、u/v 风分量逐项加权。权重是先验；有本地站点检验后可按 1/RMSE² 重新定。</p>
+      </figure>
+      <figure class="fx">
+        <figcaption>逐时形态</figcaption>
+        <p class="eq">X(h) = B̄(h) + [G(h) − Ḡ(h)]</p>
+        <p class="eq eq-2">P(h) = P<sub>3h</sub> · g(h) / Σg</p>
+        <p class="fx-note">B̄、Ḡ 为融合值与 GFS 在 3 小时节点间的直线；g 为 GFS 逐时降水。节点上与逐日产品完全一致。</p>
+      </figure>
+    </div>
+
+    <div class="criteria">
+      <h3>用语与阈值</h3>
+      <dl class="crit">
+        <div><dt>日降水</dt><dd>小雨 0.1–9.9 · 中雨 10–24.9 · 大雨 25–49.9 · 暴雨 ≥50 mm<small>GB/T 28592-2012</small></dd></div>
+        <div><dt>逐时降水</dt><dd>小雨 ≤2.5 · 中雨 2.6–7.6 · 大雨 7.7–19.9 · 强降水 ≥20 mm/h<small>无国标，按 AMS 雨强分级 + 气象部门短时强降水标准</small></dd></div>
+        <div><dt>风力</dt><dd>蒲福风级，10 m 平均风速；阵风比平均风高 2 级以上才注明<small>GB/T 28591-2012</small></dd></div>
+        <div><dt>云量</dt><dd>晴 &lt;3 成 · 少云 3–5 成 · 多云 5–8 成 · 阴 ≥8 成</dd></div>
+        <div><dt>预警提示</dt><dd>高温 ≥35/37/40 ℃ · 暴雨 ≥50/100/250 mm · 大风 阵风 ≥6 级 · 低温 ≤0 ℃</dd></div>
+      </dl>
+    </div>
+
+    <div class="limits">
+      <h3>局限，请一并看</h3>
+      <ul>
+        <li>还没有用本地气象站订正：山谷冷空气堆积、迎风坡增雨、城镇热岛都不体现。有站点数据后可用 <code>calibrate</code> 拟合逐乡镇系数。</li>
+        <li>0.25° 一格约 28 km，全县只落在十几个格点上，相邻乡镇的差异主要来自海拔订正，而不是模式本身分辨出的差别。</li>
+        <li>逐时形态只来自 GFS 一家。阵雨、雷雨的具体钟点不确定性大，建议按 3–6 小时尺度理解。</li>
+        <li>0.6 / 0.4 的融合权重是经验先验，不是本县的检验结果。</li>
+        <li>降水概率所用的 GEFS 时次可能与确定性时次不同，页面顶部会注明。</li>
+        <li>全自动生成，未经预报员人工订正，不能替代气象部门发布的预报和预警。</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7. secondary material, folded -->
   <section class="band">
     <details class="fold">
       <summary><span>预报文稿</span><span class="fold-hint">与命令行输出一致的纯文本</span></summary>

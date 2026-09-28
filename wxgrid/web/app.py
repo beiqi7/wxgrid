@@ -9,6 +9,8 @@ Routes::
     GET /api/runs             index of stored runs, newest first
     GET /api/runs/<file>      one stored product by its index `file` name
     GET /api/townships        static roster from the newest product
+    GET /api/hourly           newest hourly series, all townships (columnar)
+    GET /api/hourly/<id|name> one township's hourly rows; ?run=<file> ?hours=N
 
 Everything is served from ``--data-dir``; the server does no computation.
 """
@@ -23,7 +25,7 @@ import pathlib
 import socketserver
 import sys
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 DEFAULT_DATA_DIR = os.environ.get("WXGRID_DATA_DIR", "/var/lib/wxgrid")
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
@@ -67,7 +69,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         # Percent-decode first: stored run files carry Chinese county names.
-        path = unquote(self.path.split("?", 1)[0]).rstrip("/") or "/"
+        raw_path, _, raw_query = self.path.partition("?")
+        path = unquote(raw_path).rstrip("/") or "/"
+        query = parse_qs(raw_query)
         try:
             if path == "/" or path == "/index.html":
                 return self._static("index.html")
@@ -85,6 +89,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._run_file(path[len("/api/runs/"):])
             if path == "/api/townships":
                 return self._townships()
+            if path == "/api/hourly":
+                return self._hourly(None, query)
+            if path.startswith("/api/hourly/"):
+                return self._hourly(path[len("/api/hourly/"):], query)
             self._error(404, f"no route {path}")
         except BrokenPipeError:
             pass
@@ -96,7 +104,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         idx = self._read_json("index.json") or []
         latest = self._read_json("latest.json") or {}
         self._json({"status": "ok", "runs": len(idx),
-                    "latest": (latest.get("meta") or {}).get("run")})
+                    "latest": (latest.get("meta") or {}).get("run"),
+                    "hourly": bool(idx and idx[0].get("hourly"))})
 
     def _latest(self) -> None:
         obj = self._read_json("latest.json")
@@ -115,7 +124,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _run_file(self, name: str) -> None:
         # Strict: index filenames only, no path separators — blocks traversal.
-        if "/" in name or "\\" in name or not name.endswith(".json") or name in ("index.json", "latest.json"):
+        if not _safe_run_name(name):
             return self._error(400, "bad run id")
         obj = self._read_json(f"runs/{name}")
         self._json(obj, cache=3600) if obj is not None else self._error(404, f"no run {name}")
@@ -126,6 +135,38 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._error(404, "no product published yet")
         self._json({"townships": obj.get("townships", []),
                     "county": (obj.get("meta") or {}).get("county")}, cache=300)
+
+    def _hourly(self, key: str | None, query: dict[str, list[str]]) -> None:
+        """``/api/hourly`` (all townships, columnar) or ``/api/hourly/<id|name>`` (rows).
+
+        ``?run=<file>`` picks a stored cycle by its index ``file``; default newest.
+        ``?hours=N`` trims the one-township view to the first N hours.
+        """
+        run = (query.get("run") or [None])[0]
+        if run is not None:
+            if not _safe_run_name(run):
+                return self._error(400, "bad run id")
+            name = run
+        else:
+            idx = self._read_json("index.json") or []
+            if not idx:
+                return self._error(404, "no product published yet")
+            name = idx[0]["file"]
+        doc = self._read_json(f"hourly/{name}")
+        if doc is None:
+            return self._error(404, f"no hourly series for {name}")
+        cache = 3600 if run else 300
+        if key is None:
+            return self._json(doc, cache=cache)
+        view = township_hours(doc, key)
+        if view is None:
+            return self._error(404, f"no township {key!r} (use an id or a name from /api/townships)")
+        n = (query.get("hours") or [None])[0]
+        if n is not None:
+            if not n.isdigit() or int(n) < 1:
+                return self._error(400, "hours must be a positive integer")
+            view["hours"] = view["hours"][: int(n)]
+        self._json(view, cache=cache)
 
     def _static(self, rel: str) -> None:
         rel = rel.lstrip("/")
@@ -161,6 +202,41 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+def _safe_run_name(name: str) -> bool:
+    """A bare stored-run file name: no separators, no reserved pointer files."""
+    return ("/" not in name and "\\" not in name and name.endswith(".json")
+            and not name.startswith(".") and name not in ("index.json", "latest.json"))
+
+
+#: Per-hour fields copied from the columnar hourly file into row form.
+_HOUR_FIELDS = ("weather", "temp", "precip", "snow", "cloud", "wind_speed", "wind_dir",
+                "wind_name", "wind_force", "gust", "pop")
+
+
+def township_hours(doc: dict, key: str) -> dict | None:
+    """One township's hourly series as rows, looked up by id or by name.
+
+    Pure stdlib on purpose: the web process never imports numpy/xarray.
+    """
+    points = doc.get("points") or {}
+    pid = key if key in points else next((k for k, v in points.items() if v.get("name") == key), None)
+    if pid is None:
+        return None
+    p = points[pid]
+    times, leads = doc.get("times") or [], doc.get("lead_h") or []
+    cols = {f: p.get(f) for f in _HOUR_FIELDS if isinstance(p.get(f), list)}
+    rows = []
+    for i, t in enumerate(times):
+        row: dict = {"time": t, "lead_h": leads[i] if i < len(leads) else None}
+        for f, col in cols.items():
+            row[f] = col[i] if i < len(col) else None
+        rows.append(row)
+    return {"meta": doc.get("meta"),
+            "township": {"id": pid, "name": p.get("name"), "lat": p.get("lat"),
+                         "lon": p.get("lon"), "elevation": p.get("elevation")},
+            "hours": rows}
 
 
 def build_server(host: str, port: int, data_dir: str) -> _Server:

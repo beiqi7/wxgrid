@@ -1,0 +1,14 @@
+[Unit]
+Description=wxgrid — shared resource envelope for publish + web
+Documentation=file:/opt/wxgrid/README.md
+Before=slices.target
+
+[Slice]
+# Whole box is 4 cores / 8 GB. Everything wxgrid runs (the twice-daily publish,
+# the web server, and any manual `systemd-run --slice=wxgrid.slice ...`) shares
+# this ceiling: 30 % of the CPU and 50 % of the memory, combined.
+CPUQuota=120%
+CPUWeight=20
+MemoryHigh=3500M
+MemoryMax=4G
+TasksMax=160

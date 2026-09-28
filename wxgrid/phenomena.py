@@ -6,6 +6,9 @@ All thresholds are the CMA / national standard ones, not invented:
 * 降水量等级 — 24 h totals (GB/T 28592-2012).
 * 降雪量等级 — 24 h water equivalent.
 * 云量 — 晴 <3成, 少云 3-5成, 多云 5-8成, 阴 ≥8成.
+
+The one exception is the hourly rain word (:func:`hour_text`): there is no
+national 1 h grade, so it uses the AMS rain-rate classes (see HOURLY_RAIN).
 """
 
 from __future__ import annotations
@@ -89,6 +92,24 @@ def half_day_text(precip_mm: float, snow_mm: float, cloud_fraction: float) -> st
 def join_halves(day_text: str, night_text: str) -> str:
     """``多云转小雨`` when the two halves differ, otherwise just one word."""
     return day_text if day_text == night_text else f"{day_text}转{night_text}"
+
+
+#: Hourly rain-rate words, (upper bound mm/h exclusive, name). GB/T 28592-2012
+#: grades only 12 h and 24 h totals, so a 1 h amount is worded with the AMS
+#: observing classes instead — light <=2.5, moderate 2.6-7.6, heavy >7.6 mm/h —
+#: plus CMA's 短时强降水 criterion, >=20 mm in one hour.
+HOURLY_RAIN = ((0.1, ""), (2.6, "小雨"), (7.7, "中雨"), (20.0, "大雨"), (float("inf"), "强降水"))
+
+
+def hour_text(precip_mm: float, snow_mm: float, cloud_fraction: float) -> str:
+    """Weather for one hour: precipitation wins over sky cover."""
+    if snow_mm >= 0.1:
+        return "雨夹雪" if precip_mm - snow_mm >= 0.1 else "雪"
+    if precip_mm >= 0.1:
+        for upper, name in HOURLY_RAIN:
+            if precip_mm < upper:
+                return name
+    return sky_text(cloud_fraction)
 
 
 def pop_text(pop: float | None) -> str:

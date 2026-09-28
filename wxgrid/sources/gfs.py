@@ -14,6 +14,8 @@ Caveats this module absorbs:
 * GFS is **hourly to 120 h**, then 3-hourly to 384 h.
 * ``APCP`` appears twice in the index with identical labels; the first is used.
 * ``APCP`` is accumulated from init (``0-N hour acc``), matching ECMWF ``tp``.
+* ``TCDC`` ships an instantaneous field and a window average; the instantaneous
+  one is used, matching ECMWF ``tcc``.
 * Longitudes are 0..360 and are rolled to -180..180 here.
 """
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -32,6 +35,8 @@ from ..runs import Run
 from ._fetch import concat_messages, decode_grib, get, head_ok, session
 
 BUCKET = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+#: Last lead time GFS publishes hourly.
+HOURLY_LIMIT_H = 120
 
 #: (GRIB variable, level string) -> canonical name
 PARAMS: dict[tuple[str, str], str] = {
@@ -46,6 +51,12 @@ PARAMS: dict[tuple[str, str], str] = {
     # init (like `tp`); the downscaler then differences it into per-step snowfall.
     ("WEASD", "surface"): "snow",
 }
+#: What the hourly *shape* needs (see wxgrid.hourly): instantaneous state plus the
+#: since-init precipitation. No snowpack, no window extremes — ~30 % fewer bytes
+#: and GRIB decodes per lead time than a full step.
+LEAN_PARAMS: dict[tuple[str, str], str] = {k: v for k, v in PARAMS.items() if v != "snow"}
+#: GRIB variables that are accumulations: prefer their since-init message.
+_ACCUMULATED = {"APCP"}
 #: Extras that improve the daily aggregation; absent fields are simply skipped.
 OPTIONAL_PARAMS: dict[tuple[str, str], str] = {
     ("TMAX", "2 m above ground"): "tmax3",
@@ -162,15 +173,21 @@ def _step_blob(sess, run: Run, step: int, wanted: dict[tuple[str, str], str]) ->
 
     # GFS ships several messages of the same variable per file: for APCP both a
     # 6-hour bucket ("18-24 hour acc") and a since-init total ("0-1 day acc"), for
-    # TCDC both an instantaneous field and a 6-hour average. Rule: take the
-    # since-init accumulation when one exists (so GFS `tp` means the same as ECMWF
-    # `tp`), otherwise the first message, which is the instantaneous field.
-    best: dict[tuple[str, str], tuple[int, int, int | None]] = {}
+    # TCDC both an instantaneous field and a window average. Rule: for
+    # accumulations take the since-init message (so GFS `tp` means the same as
+    # ECMWF `tp`); for everything else take the instantaneous field, falling back
+    # to the earliest-starting window (TMAX/TMIN only come as windows). Taking the
+    # "0-N hour ave" cloud at f003/f006 made those steps a window mean while every
+    # other step was instantaneous.
+    best: dict[tuple[str, str], tuple[int, int, int]] = {}
     for var, level, offset, length, win in rows:
         key = (var, level)
         if key not in wanted:
             continue
-        rank = win if win == 0 else (10**6 if win is None else win + 10**6)
+        if var in _ACCUMULATED:
+            rank = win if win == 0 else (10**6 if win is None else win + 10**6)
+        else:
+            rank = -1 if win is None else win
         if key not in best or rank < best[key][2]:
             best[key] = (offset, length, rank)
     spans = [(o, ln) for o, ln, _ in best.values()]
@@ -208,7 +225,10 @@ def _normalise(ds: xr.Dataset, run: Run, step: int, bbox=None) -> xr.Dataset:
     ds = ds.assign_coords(longitude=(((ds["longitude"] + 180) % 360) - 180)).sortby("longitude")
     if bbox is not None:
         lat_min, lat_max, lon_min, lon_max = bbox
-        ds = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
+        # .sel() on a regular grid is a numpy *view*: without the copy every cropped
+        # lead time pins its whole 721x1440 global field (~4 MB per variable) and a
+        # 40-step fetch holds ~1 GB for a few hundred grid points.
+        ds = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max)).copy(deep=True)
     ds = ds.expand_dims(step=[step])
     ds = ds.assign_coords(valid_time=("step",
                                            [run.init_time.replace(tzinfo=None)
@@ -219,21 +239,42 @@ def _normalise(ds: xr.Dataset, run: Run, step: int, bbox=None) -> xr.Dataset:
 
 
 def fetch(run: Run, steps: list[int], *, params: dict[tuple[str, str], str] | None = None, sess=None,
-          bbox: tuple[float, float, float, float] | None = None) -> ForecastGrid:
-    """Download and normalise the requested lead times; ``bbox`` crops per lead time."""
-    sess = sess or session()
-    wanted = {**(params or PARAMS), **OPTIONAL_PARAMS, **STATIC_PARAMS}
+          bbox: tuple[float, float, float, float] | None = None, lean: bool = False,
+          workers: int = 1) -> ForecastGrid:
+    """Download and normalise the requested lead times; ``bbox`` crops per lead time.
 
-    parts = []
-    for step in sorted({int(s) for s in steps}):
+    ``lean`` fetches only :data:`LEAN_PARAMS` per lead time and the orography once
+    for the whole request — what the hourly shape needs, at ~70 % of the bytes and
+    decode CPU. ``workers`` > 1 reads lead times concurrently (the host rate limit
+    in :mod:`._fetch` still applies); each worker holds one global GRIB decode.
+    """
+    sess = sess or session()
+    if lean:
+        wanted = dict(params or LEAN_PARAMS)
+    else:
+        wanted = {**(params or PARAMS), **OPTIONAL_PARAMS, **STATIC_PARAMS}
+    want_steps = sorted({int(s) for s in steps})
+
+    def one(step: int) -> xr.Dataset:
         blob = _read_step(sess, run, step, wanted)
         ds = _normalise(decode_grib(blob), run, step, bbox)
-        for var in ("tp", "snow"):  # f000 carries no accumulation messages
+        for var in ("tp",) if lean else ("tp", "snow"):  # f000 carries no accumulation messages
             if var not in ds:
                 ds[var] = xr.zeros_like(ds["t2m"])
-        parts.append(ds)
+        return ds
+
+    if workers > 1 and len(want_steps) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(one, want_steps))
+    else:
+        parts = [one(s) for s in want_steps]
 
     ds = xr.concat(parts, dim="step") if len(parts) > 1 else parts[0]
+    if lean:
+        static = _normalise(decode_grib(_read_step(sess, run, want_steps[0], STATIC_PARAMS)),
+                            run, want_steps[0], bbox)
+        ds = ds.merge(static["orog"].isel(step=0, drop=True))
+        return ForecastGrid(ds.sortby("step"), "gfs-0p25")
     if "orog" in ds:  # orography is static; surface pressure is not
         keep = ds["orog"].isel(step=0, drop=True)
         ds = ds.drop_vars("orog").merge(keep)

@@ -66,6 +66,15 @@ OPTIONAL_PARAMS = {
     "mn2t3": "tmin3",
 }
 STATIC_PARAMS = {"z": "orog", "lsm": "lsm"}
+#: cfgrib's own variable names where they differ from the ECMWF shortName: it
+#: moves a leading digit to the end (10fg -> fg10). u10/v10/t2m happen to equal
+#: our canonical names; fg10 does not, and without this the gust was dropped
+#: silently, which also dropped it from the blend.
+CFGRIB_NAME = {"fg10": "10fg"}
+#: Open data carries the 1-hour max gust `10fg` only to 90 h; after that the same
+#: slot holds the 3-hour max `10fg3`. Ask for either, and treat both as `gust`.
+FALLBACK = {"10fg": ("10fg3",)}
+SHORTNAME_ALIAS = {"10fg3": "10fg"}
 
 
 def _path(run: Run) -> str:
@@ -185,7 +194,11 @@ def _index(sess, run: Run, step: int, *, refresh: bool = False) -> list[dict]:
 def _select(rows: list[dict], params: dict[str, str], *, required: bool = True) -> list[dict]:
     out = []
     for name in params:
-        hit = next((r for r in rows if r.get("levtype") == "sfc" and r["param"] == name), None)
+        hit = None
+        for cand in (name, *FALLBACK.get(name, ())):
+            hit = next((r for r in rows if r.get("levtype") == "sfc" and r["param"] == cand), None)
+            if hit is not None:
+                break
         if hit is None:
             if required:
                 raise KeyError(f"ECMWF index has no surface message for {name!r}")
@@ -195,6 +208,16 @@ def _select(rows: list[dict], params: dict[str, str], *, required: bool = True) 
 
 
 def _normalise(ds: xr.Dataset, run: Run, step: int, bbox=None) -> xr.Dataset:
+    # Rename by the GRIB shortName, not cfgrib's variable name: cfgrib calls 10fg
+    # `fg10` and 10fg3 something else again, and a miss drops the field silently.
+    by_short = {}
+    for v in ds.data_vars:
+        sn = ds[v].attrs.get("GRIB_shortName")
+        sn = SHORTNAME_ALIAS.get(sn, sn)
+        if sn in PARAMS or sn in OPTIONAL_PARAMS or sn in STATIC_PARAMS:
+            by_short[v] = sn
+    ds = ds.rename({v: sn for v, sn in by_short.items() if v != sn and sn not in ds})
+    ds = ds.rename({k: v for k, v in CFGRIB_NAME.items() if k in ds and v not in ds})
     ren = {k: v for k, v in {**PARAMS, **OPTIONAL_PARAMS, **STATIC_PARAMS}.items() if k in ds}
     ds = ds.rename(ren)
     for var in ("t2m", "d2m", "tmax3", "tmin3"):
@@ -212,7 +235,10 @@ def _normalise(ds: xr.Dataset, run: Run, step: int, bbox=None) -> xr.Dataset:
     ds = ds.assign_coords(longitude=(((ds["longitude"] + 180) % 360) - 180)).sortby("longitude")
     if bbox is not None:
         lat_min, lat_max, lon_min, lon_max = bbox
-        ds = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
+        # .sel() on a regular grid is a numpy *view*: without the copy every cropped
+        # lead time pins its whole 721x1440 global field (~4 MB per variable) and a
+        # 40-step fetch holds ~1 GB for a few hundred grid points.
+        ds = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max)).copy(deep=True)
     ds = ds.expand_dims(step=[step])
     ds = ds.assign_coords(valid_time=("step",
                                            [run.init_time.replace(tzinfo=None)

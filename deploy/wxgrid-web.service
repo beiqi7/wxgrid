@@ -5,6 +5,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Shares the wxgrid.slice envelope (30 % CPU / 50 % RAM for everything wxgrid).
+Slice=wxgrid.slice
 Type=simple
 WorkingDirectory=/opt/wxgrid
 Environment=PYTHONUNBUFFERED=1

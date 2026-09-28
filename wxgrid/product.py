@@ -24,8 +24,10 @@ import xarray as xr
 from . import bulletin as bulletin_mod
 from . import daily as daily_mod
 from . import downscale, phenomena, pipeline, probability
+from . import hourly as hourly_mod
 from .points import Township
 from .sources import gefs as gefs_mod
+from .sources import gfs as gfs_mod_det
 
 WEEKDAY = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -241,13 +243,31 @@ def compute(points: list[Township], *, county: str, seat: str, days: int = 5, ev
     Network-bound. ``run`` pins a cycle (a :class:`wxgrid.runs.Run`); otherwise the
     newest cycle all sources publish deep enough is used.
     """
+    prod, _ = compute_bundle(points, county=county, seat=seat, days=days, every=every,
+                             sources=sources, member=member, weights=weights, tz=tz, pad=pad,
+                             want_pop=want_pop, workers=workers, min_age_hours=min_age_hours,
+                             run=run, sess=sess, hourly=False)
+    return prod
+
+
+def compute_bundle(points: list[Township], *, county: str, seat: str, days: int = 5, every: int = 3,
+                   sources: tuple[str, ...] = ("ecmwf", "gfs"), member: str = "blend",
+                   weights: dict[str, float] | None = None, tz: float = daily_mod.TZ_CHINA,
+                   pad: float = 0.75, want_pop: bool = True, workers: int = 4,
+                   min_age_hours: float | None = None, run=None, sess=None,
+                   hourly: bool = True) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``(product, hourly)`` for one cycle; ``hourly`` is None when not requested.
+
+    The hourly series costs one extra lean GFS read per in-between hour (~80 for
+    5 days); the 3-hourly nodes it reuses are the ones the product already fetched.
+    """
     sess = sess or pipeline.session()
     steps = pipeline.step_grid(days * 24, every)
     if run is None:
         run = pipeline.common_run(sources, steps, sess=sess, min_age_hours=min_age_hours)
+    cfg = downscale.DownscaleConfig()
     member_ds = pipeline.forecast(points, steps=steps, sources=sources, pad=pad,
-                                  weights=weights, cfg=downscale.DownscaleConfig(),
-                                  sess=sess, run=run)
+                                  weights=weights, cfg=cfg, sess=sess, run=run)
     if member not in member_ds:
         raise KeyError(f"member {member!r} not produced; have {sorted(member_ds)}")
     chosen = member_ds[member]
@@ -255,7 +275,7 @@ def compute(points: list[Township], *, county: str, seat: str, days: int = 5, ev
     halves = daily_mod.half_day(chosen, tz_hours=tz)
     windows = daily_mod.precip_windows(chosen, tz_hours=tz)
 
-    pop = None
+    pop = ens = ens_run = None
     if want_pop:
         ens_steps = list(range(6, days * 24 + 1, 6))
         kw = {"min_age_hours": min_age_hours} if min_age_hours else {}
@@ -265,5 +285,29 @@ def compute(points: list[Township], *, county: str, seat: str, days: int = 5, ev
             ens = gefs_mod.fetch_ensemble(points, ens_run, ens_steps, sess=sess, max_workers=workers)
             pop = probability.daily_pop(ens, dly["day"].values, tz)
 
-    return build(dly, halves, windows, county=county, seat=seat, run=str(run),
+    prod = build(dly, halves, windows, county=county, seat=seat, run=str(run),
                  member=member, sources=sources, weights=weights, tz=tz, days=days, pop=pop)
+    if not hourly:
+        return prod, None
+
+    shape = None
+    gfs_key = "gfs-0p25"
+    if gfs_key in member_ds:
+        extra_hours = hourly_mod.shape_hours(steps, limit=gfs_mod_det.HOURLY_LIMIT_H)
+        lat_min, lat_max, lon_min, lon_max = pipeline.bbox_of(points, pad)
+        bbox = (lat_min, lat_max, lon_min, lon_max) if lon_min <= lon_max else None
+        grid = gfs_mod_det.fetch(run, extra_hours, sess=sess, bbox=bbox, lean=True,
+                                 workers=max(1, min(workers, 2)))
+        if bbox is None:
+            grid = grid.bbox(lat_min, lat_max, lon_min, lon_max)
+        extra = downscale.apply(grid, points, cfg)
+        shape = hourly_mod.merge_shape(member_ds[gfs_key], extra)
+    hr = hourly_mod.disaggregate(chosen, shape, limit=gfs_mod_det.HOURLY_LIMIT_H)
+    hpop = None
+    if ens is not None:
+        hpop = hourly_mod.hourly_pop(ens, np.datetime64(str(chosen.attrs["init_time"]), "h"),
+                                     hr["step"].values)
+    hdoc = hourly_mod.build(hr, county=county, seat=seat, run=str(run), tz=tz, pop=hpop,
+                            pop_members=len(ens.members) if ens is not None else 0,
+                            pop_run=str(ens_run) if ens is not None else None)
+    return prod, hdoc

@@ -8,8 +8,12 @@ owns restart/liveness), triggering at fixed local clock times.
 Layout under ``--data-dir`` (default ``/var/lib/wxgrid``)::
 
     runs/<county>_<run>.json    one product per cycle
+    hourly/<county>_<run>.json  the same cycle's hourly township series (same file name)
     latest.json                 -> newest product (the API's default)
-    index.json                  [{county, run, init_time, generated}, ...] newest first
+    index.json                  [{file, county, run, init_time, generated, hourly}, ...] newest first
+
+The cycle is resolved *before* anything is downloaded, so a timer firing on a
+cycle that is already on disk costs a few HEAD requests, not a full fetch.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import time
 from typing import Any
 
 from . import daily as daily_mod
+from . import pipeline
 from . import points as points_mod
 from . import product
 from .sources._fetch import session
@@ -30,6 +35,10 @@ from .sources._fetch import session
 DEFAULT_DATA_DIR = os.environ.get("WXGRID_DATA_DIR", "/var/lib/wxgrid")
 #: Local clock hours (in --tz) at which the daily job fires.
 DEFAULT_HOURS = (7, 18)
+#: GRIB byte-range cache entries older than this are deleted at the start of a
+#: publish. The cache only pays off when the *same* cycle is re-run (a retry after
+#: a failure); an older cycle is never read again.
+CACHE_MAX_AGE_H = 36.0
 
 
 def _atomic_write_json(path: pathlib.Path, obj: Any) -> None:
@@ -48,7 +57,8 @@ def _rebuild_index(data_dir: pathlib.Path) -> list[dict]:
             continue
         entries.append({"file": p.name, "county": meta.get("county"), "run": meta.get("run"),
                         "init_time": meta.get("init_time"), "generated": meta.get("generated"),
-                        "member": meta.get("member"), "days": meta.get("days")})
+                        "member": meta.get("member"), "days": meta.get("days"),
+                        "hourly": (data_dir / "hourly" / p.name).exists()})
     entries.sort(key=lambda e: (e.get("generated") or "", e.get("run") or ""), reverse=True)
     _atomic_write_json(data_dir / "index.json", entries)
     return entries
@@ -58,31 +68,57 @@ def _slug(county: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in county) or "county"
 
 
+def _prune_cache(max_age_h: float = CACHE_MAX_AGE_H) -> int:
+    """Delete stale GRIB cache entries under ``$WXGRID_CACHE``; returns how many."""
+    raw = os.environ.get("WXGRID_CACHE")
+    if not raw:
+        return 0
+    cutoff = time.time() - max_age_h * 3600
+    gone = 0
+    for p in pathlib.Path(os.path.expanduser(raw)).glob("*.grib2*"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                gone += 1
+        except OSError:
+            pass
+    return gone
+
+
 def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFAULT_DATA_DIR,
                  days: int = 5, every: int = 3, sources: str = "ecmwf,gfs", member: str = "blend",
                  tz: float = daily_mod.TZ_CHINA, want_pop: bool = True, workers: int = 4,
                  keep: int = 60, min_age_hours: float | None = None,
-                 force: bool = False, sess=None) -> pathlib.Path:
-    """Compute one product and store it. Returns the run file path.
+                 force: bool = False, hourly: bool = True, sess=None) -> pathlib.Path:
+    """Compute one product (and its hourly series) and store it. Returns the run file path.
 
-    Skips recomputation when the newest common cycle is already on disk (saves the
-    ~9-minute download), unless ``force``.
+    Resolves the newest common cycle first and returns without downloading when
+    that cycle's files are already on disk, unless ``force``. A cycle stored
+    before hourly series existed is recomputed once to backfill it.
     """
     data = pathlib.Path(data_dir)
     (data / "runs").mkdir(parents=True, exist_ok=True)
+    (data / "hourly").mkdir(parents=True, exist_ok=True)
+    _prune_cache()
     pts = points_mod.load_csv(townships)
     sess = sess or session()
     src = tuple(sources.split(","))
 
-    prod = product.compute(pts, county=county, seat=seat, days=days, every=every, sources=src,
-                           member=member, tz=tz, want_pop=want_pop, workers=workers,
-                           min_age_hours=min_age_hours, sess=sess)
-    run_stamp = prod["meta"]["run"]
-    out = data / "runs" / f"{_slug(county)}_{run_stamp}.json"
-    if out.exists() and not force:
+    run = pipeline.common_run(src, pipeline.step_grid(days * 24, every), sess=sess,
+                              min_age_hours=min_age_hours)
+    out = data / "runs" / f"{_slug(county)}_{run.stamp}.json"
+    hourly_out = data / "hourly" / out.name
+    if not force and out.exists() and (hourly_out.exists() or not hourly):
         # Already have this cycle; just make sure latest/index point at the newest.
         _refresh_pointers(data, keep)
         return out
+
+    prod, hdoc = product.compute_bundle(pts, county=county, seat=seat, days=days, every=every,
+                                        sources=src, member=member, tz=tz, want_pop=want_pop,
+                                        workers=workers, min_age_hours=min_age_hours, run=run,
+                                        sess=sess, hourly=hourly)
+    if hdoc is not None:  # hourly first: the index marks a run hourly only once both exist
+        _atomic_write_json(hourly_out, hdoc)
     _atomic_write_json(out, prod)
     _refresh_pointers(data, keep)
     return out
@@ -99,6 +135,11 @@ def _refresh_pointers(data: pathlib.Path, keep: int) -> None:
         for p in sorted(files, key=lambda p: p.stat().st_mtime)[:-keep]:
             p.unlink(missing_ok=True)
         _rebuild_index(data)
+    # an hourly series outlives its run file only by accident; drop orphans
+    live = {p.name for p in (data / "runs").glob("*.json")}
+    for p in (data / "hourly").glob("*.json"):
+        if p.name not in live:
+            p.unlink(missing_ok=True)
 
 
 def _seconds_until(hours: tuple[int, ...], tz: float) -> float:
@@ -145,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--keep", type=int, default=60)
     p.add_argument("--min-age-hours", type=float, default=None)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-hourly", action="store_true",
+                   help="skip the hourly series (saves ~80 lean GFS reads per cycle)")
     p.add_argument("--loop", action="store_true", help="run forever on the daily schedule")
     p.add_argument("--at", default=",".join(map(str, DEFAULT_HOURS)),
                    help="comma-separated local hours to fire at in --loop mode")
@@ -153,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     kw = dict(townships=args.townships, county=args.county, seat=args.seat, data_dir=args.data_dir,
               days=args.days, every=args.every, sources=args.sources, member=args.member,
               tz=args.tz, want_pop=not args.no_pop, workers=args.workers, keep=args.keep,
-              min_age_hours=args.min_age_hours, force=args.force)
+              min_age_hours=args.min_age_hours, force=args.force, hourly=not args.no_hourly)
     if args.loop:
         hours = tuple(int(x) for x in args.at.split(","))
         serve_schedule(hours=hours, tz=args.tz, **kw)

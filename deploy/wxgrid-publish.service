@@ -5,6 +5,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Shares the wxgrid.slice envelope (30 % CPU / 50 % RAM for everything wxgrid).
+Slice=wxgrid.slice
 Type=oneshot
 WorkingDirectory=/opt/wxgrid
 Environment=PYTHONUNBUFFERED=1
@@ -15,7 +17,7 @@ ExecStart=/usr/bin/python3 -m wxgrid publish \
     --data-dir /var/lib/wxgrid \
     --days 5 --workers 2 --keep 60
 
-# One cycle is ~10 min wall / ~2 min CPU. Kill it well before the next timer.
+# One cycle (daily + hourly) is ~10 min wall / ~2.3 min CPU. Kill it well before the next timer.
 TimeoutStartSec=45min
 
 # --- resource envelope: stay near 30 % of a 4-core / 8 GB box ---
