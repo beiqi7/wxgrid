@@ -27,7 +27,6 @@ import time
 from typing import Any
 
 from . import daily as daily_mod
-from . import pipeline
 from . import points as points_mod
 from . import product
 from .sources._fetch import session
@@ -68,6 +67,22 @@ def _slug(county: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in county) or "county"
 
 
+#: Stored runs in an older JSON shape are recomputed (see product.SCHEMA).
+SCHEMA = product.SCHEMA
+
+
+def _is_current(path: pathlib.Path, first_period_start: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    periods = doc.get("periods") or []
+    return (doc.get("meta", {}).get("schema") == SCHEMA and bool(periods)
+            and periods[0].get("start_local") == first_period_start)
+
+
 def _prune_cache(max_age_h: float = CACHE_MAX_AGE_H) -> int:
     """Delete stale GRIB cache entries under ``$WXGRID_CACHE``; returns how many."""
     raw = os.environ.get("WXGRID_CACHE")
@@ -89,12 +104,14 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
                  days: int = 5, every: int = 3, sources: str = "ecmwf,gfs", member: str = "blend",
                  tz: float = daily_mod.TZ_CHINA, want_pop: bool = True, workers: int = 4,
                  keep: int = 60, min_age_hours: float | None = None,
-                 force: bool = False, hourly: bool = True, sess=None) -> pathlib.Path:
+                 force: bool = False, hourly: bool = True, issue_utc=None, sess=None) -> pathlib.Path:
     """Compute one product (and its hourly series) and store it. Returns the run file path.
 
-    Resolves the newest common cycle first and returns without downloading when
-    that cycle's files are already on disk, unless ``force``. A cycle stored
-    before hourly series existed is recomputed once to backfill it.
+    Resolves the cycle and the forecast periods first (they depend on the issue
+    time: 07:30 opens with 今天白天, 19:30 with 今天夜间) and returns without
+    downloading when that cycle is on disk with the same first period in the
+    current format, unless ``force``. Anything else — an older format, a missing
+    hourly file, the same cycle re-issued for a later period — is recomputed.
     """
     data = pathlib.Path(data_dir)
     (data / "runs").mkdir(parents=True, exist_ok=True)
@@ -104,19 +121,19 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
     sess = sess or session()
     src = tuple(sources.split(","))
 
-    run = pipeline.common_run(src, pipeline.step_grid(days * 24, every), sess=sess,
-                              min_age_hours=min_age_hours)
+    issue = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    run, plan = product.choose_run(src, issue, n_days=days, tz=tz, sess=sess, min_age_hours=min_age_hours)
     out = data / "runs" / f"{_slug(county)}_{run.stamp}.json"
     hourly_out = data / "hourly" / out.name
-    if not force and out.exists() and (hourly_out.exists() or not hourly):
-        # Already have this cycle; just make sure latest/index point at the newest.
+    if not force and _is_current(out, plan[0].start_local) and (hourly_out.exists() or not hourly):
+        # Same cycle, same first period, current format: nothing to download.
         _refresh_pointers(data, keep)
         return out
 
     prod, hdoc = product.compute_bundle(pts, county=county, seat=seat, days=days, every=every,
                                         sources=src, member=member, tz=tz, want_pop=want_pop,
                                         workers=workers, min_age_hours=min_age_hours, run=run,
-                                        sess=sess, hourly=hourly)
+                                        issue_utc=issue, sess=sess, hourly=hourly)
     if hdoc is not None:  # hourly first: the index marks a run hourly only once both exist
         _atomic_write_json(hourly_out, hdoc)
     _atomic_write_json(out, prod)

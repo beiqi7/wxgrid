@@ -1,6 +1,7 @@
 """Regressions for the read-only API and the JSON product builder."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 import threading
@@ -12,13 +13,15 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from wxgrid import blend, daily, downscale, product
+from wxgrid import blend, daily, downscale, periods, product
 from wxgrid.grid import ForecastGrid
 from wxgrid.points import Township
 from wxgrid.web import app as webapp
 
-INIT = np.datetime64("2026-09-15T18:00")
-STEPS = list(range(3, 121, 3))
+INIT = np.datetime64("2026-09-15T12:00")          # 20:00 BJT
+ISSUE = dt.datetime(2026, 9, 15, 23, 30)          # 07:30 BJT next morning -> opens with 今天白天
+PLAN = periods.plan(INIT, ISSUE)
+STEPS = periods.steps_for(PLAN)
 PTS = [Township("A", "甲镇", 28.30, 117.70, 60.0),
        Township("B", "乙乡", 28.10, 117.60, 600.0)]
 
@@ -50,17 +53,16 @@ def _grid(source: str, *, precip_rate=None) -> ForecastGrid:
     return ForecastGrid(ds, source)
 
 
-def _product(precip_rate=None) -> dict:
+def _blend(precip_rate=None):
     e = downscale.apply(_grid("ecmwf-ifs-0p25", precip_rate=precip_rate), PTS)
     g = downscale.apply(_grid("gfs-0p25", precip_rate=precip_rate), PTS)
-    b = blend.combine({"ecmwf-ifs-0p25": e, "gfs-0p25": g})
-    dly = daily.to_daily(b)
-    halves = daily.half_day(b)
-    windows = daily.precip_windows(b)
-    return product.build(dly, halves, windows, county="测试县", seat="甲镇",
-                         run="2026091518", member="blend",
-                         sources=("ecmwf", "gfs"), weights=None,
-                         tz=daily.TZ_CHINA, days=5)
+    return blend.combine({"ecmwf-ifs-0p25": e, "gfs-0p25": g})
+
+
+def _product(precip_rate=None) -> dict:
+    return product.build(_blend(precip_rate), periods=PLAN, issue_utc=ISSUE, county="测试县", seat="甲镇",
+                         run="2026091512", member="blend", sources=("ecmwf", "gfs"), weights=None,
+                         tz=daily.TZ_CHINA)
 
 
 # ---------------------------------------------------------------- product
@@ -73,21 +75,24 @@ def test_product_is_json_serialisable_with_no_nan():
     assert json.loads(text)["meta"]["county"] == "测试县"
 
 
-def test_product_shape_matches_townships_and_days():
+def test_product_shape_is_five_days_of_day_and_night():
     doc = _product()
-    assert len(doc["days"]) == 5
+    assert [q["kind"] for q in doc["periods"]] == ["day", "night"] * 5
+    assert doc["periods"][0]["label"] == "今天白天"
+    assert len(doc["days"]) == 5 and all(d["day"] is not None and d["night"] is not None for d in doc["days"])
     assert len(doc["townships"]) == len(PTS)
-    for day in doc["days"]:
-        assert len(day["cells"]) == len(PTS)
-        assert {c["point"] for c in day["cells"]} == {"A", "B"}
+    for q in doc["periods"]:
+        assert {c["point"] for c in q["cells"]} == {"A", "B"}
+        for c in q["cells"]:
+            assert c["wind_text"] and c["wind_text"] != "—", "every period states its wind"
 
 
 def test_product_keeps_gust_so_bulletin_can_report_it():
     """Regression: the blend used to drop `gust`, so 阵风 never appeared."""
     doc = _product()
-    gusts = [c["wind_gust"] for d in doc["days"] for c in d["cells"]]
+    gusts = [c["gust"] for q in doc["periods"] for c in q["cells"]]
     assert max(gusts) == pytest.approx(14.0)
-    assert "阵风" in doc["text"]
+    assert "阵风7级" in doc["text"]
 
 
 def test_conclusions_name_the_seat_township():
@@ -99,21 +104,27 @@ def test_conclusions_name_the_seat_township():
 
 def test_rain_alert_fires_on_a_heavy_day():
     rate = np.zeros(len(STEPS))
-    rate[8:16] = 9.0  # ~72 mm inside one local day
+    rate[8:16] = 9.0  # 72 mm in 24 h, 36 mm in 12 h: under every signal standard
     doc = _product(precip_rate=rate)
-    kinds = {a["type"] for a in doc["conclusions"]["alerts"]}
-    assert "暴雨" in kinds
+    rain = [a for a in doc["conclusions"]["alerts"] if a["type"] == "暴雨"]
+    assert rain and rain[0]["level"] == "关注"
 
 
-def test_multi_day_rain_lists_a_window_on_every_wet_day():
-    """Regression: a span crossing local midnight was keyed only to its start day."""
+def test_every_wet_period_lists_its_rain_hours():
     rate = np.zeros(len(STEPS))
     rate[4:28] = 1.0
     doc = _product(precip_rate=rate)
-    wet = [d for d in doc["days"] if (d["cells"][0]["precip"] or 0) >= 0.1]
-    assert len(wet) >= 3
-    for d in wet:
-        assert d["cells"][0]["windows"], f"{d['date']} is wet but lists no window"
+    wet = [q for q in doc["periods"] if (q["cells"][0]["precip"] or 0) >= 0.1]
+    assert len(wet) >= 5
+    for q in wet:
+        assert q["cells"][0]["windows"], f"{q['label']} is wet but lists no rain hours"
+
+
+def test_no_probability_in_the_forecast_text():
+    """Chinese public forecasts state the weather, not its odds."""
+    doc = _product()
+    assert "概率" not in doc["text"] and "%" not in doc["text"]
+    assert "%" not in doc["conclusions"]["headline"]
 
 
 # ---------------------------------------------------------------- API
@@ -158,6 +169,32 @@ def test_api_serves_latest_and_summary(server):
     assert code == 200
     small = json.loads(body)
     assert "conclusions" in small and "cells" not in json.dumps(small)
+    assert len(small["periods"]) == 10 and small["periods"][0]["county"]["weather"]
+
+
+def test_api_forecast_for_one_township_by_name_or_id(server):
+    base, name = server
+    code, body, _ = _get(f"{base}/api/forecast/{urllib.parse.quote('乙乡')}")
+    view = json.loads(body)
+    assert code == 200 and view["township"]["id"] == "B"
+    assert [r["label"] for r in view["periods"]][:2] == ["今天白天", "今天夜间"]
+    assert {"weather", "temp", "wind_text", "precip", "pop"} <= set(view["periods"][0])
+    code, body, _ = _get(f"{base}/api/forecast/A?run={urllib.parse.quote(name)}")
+    assert code == 200 and json.loads(body)["township"]["name"] == "甲镇"
+    assert _status(f"{base}/api/forecast/nowhere") == 404
+
+
+def test_api_3h_series_rows_and_columns(server):
+    base, _ = server
+    code, body, _ = _get(f"{base}/api/3h/A?hours=24")
+    view = json.loads(body)
+    assert code == 200 and len(view["hours"]) == 8
+    assert view["hours"][0]["time"] == "2026-09-16T08:00"   # first window ending after 07:30 BJT
+    assert {"weather", "temp", "precip", "wind_force", "pop"} <= set(view["hours"][0])
+    code, body, _ = _get(f"{base}/api/3h")
+    cols = json.loads(body)
+    assert code == 200 and len(cols["times"]) == 24 and cols["points"]["B"]["name"] == "乙乡"
+    assert _status(f"{base}/api/3h/A?hours=x") == 400
 
 
 def test_api_fetches_a_run_with_a_chinese_filename(server):
@@ -165,7 +202,7 @@ def test_api_fetches_a_run_with_a_chinese_filename(server):
     base, name = server
     code, body, _ = _get(f"{base}/api/runs/{urllib.parse.quote(name)}")
     assert code == 200
-    assert json.loads(body)["meta"]["run"] == "2026091518"
+    assert json.loads(body)["meta"]["run"] == "2026091512"
 
 
 @pytest.mark.parametrize("bad", [

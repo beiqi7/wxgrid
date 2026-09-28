@@ -5,16 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-import numpy as np
-import xarray as xr
-
 from . import blend as blending
-from . import bulletin as bulletin_mod
 from . import calibrate as calibration
 from . import daily as daily_mod
 from . import dem as dem_mod
-from . import downscale, pipeline, points as points_mod, probability, report, store
-from .sources import gefs as gefs_mod
+from . import downscale, pipeline, points as points_mod, report, store
 from .sources import REGISTRY
 from .sources._fetch import session
 from .runs import Run
@@ -100,51 +95,22 @@ def cmd_daily(args) -> int:
 
 
 def cmd_bulletin(args) -> int:
+    """County-seat + per-township bulletin in 白天/夜间 periods (no probabilities)."""
+    import json
+
+    from . import product
+
     pts = _load_points(args)
-    days = args.days
-    steps = pipeline.step_grid(days * 24, args.every)
     sources = tuple(args.sources.split(","))
-    sess = pipeline.session()
-    if args.run:
-        run = Run.from_stamp(args.run)
-        missing = [s for s in sources if not REGISTRY[s].probe_run(sess, run, max(steps))]
-        if missing:
-            raise SystemExit(f"run {args.run}: sources {missing} not published out to {max(steps)}h")
-    else:
-        run = pipeline.common_run(sources, steps, sess=sess, min_age_hours=args.min_age_hours)
-
-    member_ds = pipeline.forecast(pts, steps=steps, sources=sources, pad=args.pad,
-                                  weights=_parse_weights(args.weights),
-                                  cfg=downscale.DownscaleConfig(), sess=sess, run=run)
-    daily = daily_mod.to_daily(member_ds[args.member], tz_hours=args.tz)
-    halves = daily_mod.half_day(member_ds[args.member], tz_hours=args.tz)
-    windows = daily_mod.precip_windows(member_ds[args.member], tz_hours=args.tz)
-
-    pop = None
-    if not args.no_pop:
-        ens_steps = list(range(6, days * 24 + 1, 6))
-        ens_run = next((c for c in gefs_mod.candidate_runs(
-            **({"min_age_hours": args.min_age_hours} if args.min_age_hours else {}))
-                        if gefs_mod.probe_run(sess, c, max(ens_steps))), None)
-        if ens_run is None:
-            print("降水概率：GEFS 未来 cycle 尚未发布到所需时效，跳过", file=sys.stderr)
-        else:
-            print(f"降水概率：GEFS {len(gefs_mod.MEMBERS)} 成员，cycle {ens_run}，"
-                  f"{len(ens_steps)} 个 6 小时时段", file=sys.stderr)
-            ens = gefs_mod.fetch_ensemble(pts, ens_run, ens_steps, sess=sess, max_workers=args.workers)
-            pop = probability.daily_pop(ens, daily["day"].values, args.tz)
-
-    print(bulletin_mod.header(args.county, str(run),
-                              np.asarray(daily.attrs["init_time"], dtype="datetime64[m]"),
-                              len(pts), days, args.member, args.tz))
-    print()
-    print(bulletin_mod.seat_forecast(daily, halves, args.seat, pop=pop, windows=windows,
-                                     days=days, tz=args.tz))
-    print()
-    print(bulletin_mod.day_blocks(daily, halves, pop=pop, windows=windows, days=days))
+    run = Run.from_stamp(args.run) if args.run else None
+    doc = product.compute(pts, county=args.county, seat=args.seat, days=args.days, every=args.every,
+                          sources=sources, member=args.member, weights=_parse_weights(args.weights),
+                          tz=args.tz, pad=args.pad, want_pop=not args.no_pop, workers=args.workers,
+                          min_age_hours=args.min_age_hours, run=run)
+    print(doc["text"])
     if args.out:
-        out = daily if pop is None else xr.merge([daily, pop.rename("pop")])
-        out.to_netcdf(args.out)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False)
         print(f"\nwrote {args.out}")
     return 0
 
@@ -240,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--out", default=None, help="optional NetCDF of the daily aggregates")
     d.set_defaults(func=cmd_daily)
 
-    b = sub.add_parser("bulletin", help="county-seat + per-township bulletin, with probabilities")
+    b = sub.add_parser("bulletin", help="county-seat + per-township bulletin in 白天/夜间 periods")
     b.add_argument("--townships", required=True)
     b.add_argument("--county", default="")
     b.add_argument("--seat", required=True, help="name of the county-seat township")
@@ -249,14 +215,15 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--tz", type=float, default=daily_mod.TZ_CHINA)
     b.add_argument("--member", default="blend")
     b.add_argument("--sources", default="ecmwf,gfs")
-    b.add_argument("--no-pop", action="store_true", help="skip the ensemble download")
+    b.add_argument("--no-pop", action="store_true",
+                   help="skip the ensemble download (probabilities only appear in the JSON)")
     b.add_argument("--workers", type=int, default=8)
     b.add_argument("--pad", type=float, default=0.75)
     b.add_argument("--weights", default=None)
     b.add_argument("--run", default=None)
     b.add_argument("--min-age-hours", type=float, default=None,
                    help="ignore cycles younger than this (default 2, i.e. use the settled cycle)")
-    b.add_argument("--out", default=None)
+    b.add_argument("--out", default=None, help="also write the product JSON here")
     b.set_defaults(func=cmd_bulletin)
 
     f = sub.add_parser("fetch", help="download, downscale and blend a county forecast")

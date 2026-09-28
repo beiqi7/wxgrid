@@ -9,7 +9,10 @@ Routes::
     GET /api/runs             index of stored runs, newest first
     GET /api/runs/<file>      one stored product by its index `file` name
     GET /api/townships        static roster from the newest product
-    GET /api/hourly           newest hourly series, all townships (columnar)
+    GET /api/forecast/<id|name>  one township's 白天/夜间 forecast rows; ?run=<file>
+    GET /api/3h               the 0-72 h 3-hourly series, all townships (columnar)
+    GET /api/3h/<id|name>     one township's 3-hourly rows; ?run=<file> ?hours=N
+    GET /api/hourly           hourly series (reference only), all townships (columnar)
     GET /api/hourly/<id|name> one township's hourly rows; ?run=<file> ?hours=N
 
 Everything is served from ``--data-dir``; the server does no computation.
@@ -89,6 +92,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._run_file(path[len("/api/runs/"):])
             if path == "/api/townships":
                 return self._townships()
+            if path.startswith("/api/forecast/"):
+                return self._forecast(path[len("/api/forecast/"):], query)
+            if path == "/api/3h":
+                return self._series3h(None, query)
+            if path.startswith("/api/3h/"):
+                return self._series3h(path[len("/api/3h/"):], query)
             if path == "/api/hourly":
                 return self._hourly(None, query)
             if path.startswith("/api/hourly/"):
@@ -116,8 +125,63 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if obj is None:
             return self._error(404, "no product published yet")
         self._json({"meta": obj.get("meta"), "conclusions": obj.get("conclusions"),
-                    "days": [{"date": d["date"], "weekday": d["weekday"], "county": d["county"]}
-                             for d in obj.get("days", [])]}, cache=300)
+                    "days": obj.get("days", []),
+                    "periods": [{k: v for k, v in q.items() if k != "cells"} for q in obj.get("periods", [])]},
+                   cache=300)
+
+    def _product(self, query: dict[str, list[str]]):
+        """``(doc, cache_seconds)`` for ``?run=<file>`` or the newest product; error sent on failure."""
+        run = (query.get("run") or [None])[0]
+        if run is not None:
+            if not _safe_run_name(run):
+                self._error(400, "bad run id")
+                return None, 0
+            doc = self._read_json(f"runs/{run}")
+            if doc is None:
+                self._error(404, f"no run {run}")
+            return doc, 3600
+        doc = self._read_json("latest.json")
+        if doc is None:
+            self._error(404, "no product published yet")
+        return doc, 300
+
+    def _forecast(self, key: str, query: dict[str, list[str]]) -> None:
+        doc, cache = self._product(query)
+        if doc is None:
+            return
+        view = township_periods(doc, key)
+        if view is None:
+            return self._error(404, f"no township {key!r} (use an id or a name from /api/townships)")
+        self._json(view, cache=cache)
+
+    def _series3h(self, key: str | None, query: dict[str, list[str]]) -> None:
+        doc, cache = self._product(query)
+        if doc is None:
+            return
+        series = doc.get("series3h")
+        if not series:
+            return self._error(404, "this run has no 3-hourly series (published before it existed)")
+        names = {t["id"]: t for t in doc.get("townships", [])}
+        cols = {"meta": {**{k: doc.get("meta", {}).get(k) for k in ("county", "run", "issue_local", "tz")},
+                         "step_hours": series.get("step_hours"),
+                         "time_convention": series.get("time_convention")},
+                "times": series.get("times", []), "lead_h": series.get("lead_h", []),
+                "points": {pid: {**p, "name": names.get(pid, {}).get("name"),
+                                 "lat": names.get(pid, {}).get("lat"), "lon": names.get(pid, {}).get("lon"),
+                                 "elevation": names.get(pid, {}).get("elevation")}
+                           for pid, p in (series.get("points") or {}).items()}}
+        if key is None:
+            return self._json(cols, cache=cache)
+        view = township_hours(cols, key)
+        if view is None:
+            return self._error(404, f"no township {key!r} (use an id or a name from /api/townships)")
+        n = (query.get("hours") or [None])[0]
+        if n is not None:
+            if not n.isdigit() or int(n) < 1:
+                return self._error(400, "hours must be a positive integer")
+            step = int(series.get("step_hours") or 3)
+            view["hours"] = [r for r in view["hours"] if r["lead_h"] is not None][: max(1, int(n) // step)]
+        self._json(view, cache=cache)
 
     def _runs(self) -> None:
         self._json(self._read_json("index.json") or [], cache=60)
@@ -215,6 +279,34 @@ _HOUR_FIELDS = ("weather", "temp", "precip", "snow", "cloud", "wind_speed", "win
                 "wind_name", "wind_force", "gust", "pop")
 
 
+#: Per-period fields copied into the one-township forecast view.
+_PERIOD_FIELDS = ("weather", "temp", "tmax", "tmin", "precip", "snow", "wind_text", "wind_name",
+                  "force_text", "force_lo", "force_hi", "gust", "gust_force", "windows_text", "pop")
+
+
+def _find_township(doc: dict, key: str) -> dict | None:
+    return next((t for t in doc.get("townships", []) if t.get("id") == key or t.get("name") == key), None)
+
+
+def township_periods(doc: dict, key: str) -> dict | None:
+    """One township's 白天/夜间 forecast, one row per period."""
+    t = _find_township(doc, key)
+    if t is None:
+        return None
+    rows = []
+    for q in doc.get("periods", []):
+        c = next((x for x in q.get("cells", []) if x.get("point") == t["id"]), None)
+        if c is None:
+            continue
+        rows.append({"label": q.get("label"), "date": q.get("date"), "kind": q.get("kind"),
+                     "name": q.get("name"), "start": q.get("start_local"), "end": q.get("end_local"),
+                     **{f: c.get(f) for f in _PERIOD_FIELDS}})
+    meta = doc.get("meta", {})
+    return {"meta": {k: meta.get(k) for k in ("county", "run", "issue_local", "tz", "source_label")},
+            "township": t, "periods": rows,
+            "note": "pop is the GEFS ensemble probability of >=0.1 mm in the period (detail only)"}
+
+
 def township_hours(doc: dict, key: str) -> dict | None:
     """One township's hourly series as rows, looked up by id or by name.
 
@@ -226,11 +318,11 @@ def township_hours(doc: dict, key: str) -> dict | None:
         return None
     p = points[pid]
     times, leads = doc.get("times") or [], doc.get("lead_h") or []
-    cols = {f: p.get(f) for f in _HOUR_FIELDS if isinstance(p.get(f), list)}
+    cols = {f: p.get(f) if isinstance(p.get(f), list) else [] for f in _HOUR_FIELDS}
     rows = []
     for i, t in enumerate(times):
         row: dict = {"time": t, "lead_h": leads[i] if i < len(leads) else None}
-        for f, col in cols.items():
+        for f, col in cols.items():  # every field is present; null where the run has none
             row[f] = col[i] if i < len(col) else None
         rows.append(row)
     return {"meta": doc.get("meta"),

@@ -1,26 +1,18 @@
-"""Bulletin rendering: a county-seat forecast and a per-township table.
+"""Plain-text bulletin, rendered from the product JSON.
 
-The county-seat block is the one a duty forecaster actually reads out; the
-township tables are the attachment. Both are driven off the same daily and
-half-day aggregates, so they can never disagree.
+Rendering from the JSON (instead of recomputing from the model data) means the
+text, the API and the web page cannot disagree. The layout follows a county
+bulletin: the county seat period by period (今天夜间 / 明天白天 / …), then one
+block per date listing every township. No probabilities appear here — Chinese
+public forecasts state the weather, not its odds; the odds stay in the JSON's
+detail fields.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import unicodedata
 
-import numpy as np
-import xarray as xr
-
-from . import daily as daily_mod, phenomena
-
 WEEKDAY = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
-#: 降水概率 is P(daily precipitation >= this), the CMA criterion, and the same
-#: cut is used for the "is there a rain window" question — one criterion, one
-#: meaning, so the two columns can never contradict each other.
-TRACE_MM = 0.1
 
 
 def _width(text: str) -> int:
@@ -28,131 +20,84 @@ def _width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
-def _pad(text: str, width: int, align: str = "<") -> str:
+def _pad(text, width: int, align: str = "<") -> str:
     text = str(text)
     fill = " " * max(0, width - _width(text))
     return fill + text if align == ">" else text + fill
 
 
-def _timing(spans, pop: float | None) -> str:
-    """Rain window, or an honest statement that it is scattered/absent."""
-    if spans:
-        return daily_mod.format_windows(spans)
-    if pop is not None and pop >= 30:
-        return "零星，无集中时段"
-    return "无"
+def _md(date: str) -> str:
+    return f"{int(date[5:7])}月{int(date[8:10])}日"
 
 
-def _date_label(day: np.datetime64) -> str:
-    d = day.astype("datetime64[D]").astype(dt.date)
-    return f"{d.month}月{d.day}日 {WEEKDAY[d.weekday()]}"
+def _temp(v) -> str:
+    return "—" if v is None else f"{v:.0f}"
 
 
-def _beijing(ts: np.datetime64, tz_hours: float = 8.0) -> str:
-    local_h = int(np.asarray(ts).astype("datetime64[h]").astype("int64")) + int(tz_hours)
-    d = np.datetime64(local_h // 24, "D").astype(dt.date)
-    return f"{d.month}月{d.day}日{local_h % 24:02d}时"
+def _issue_text(meta: dict) -> str:
+    loc = meta.get("issue_local") or ""
+    if len(loc) >= 16:
+        return f"{int(loc[5:7])}月{int(loc[8:10])}日{loc[11:13]}时{loc[14:16]}分"
+    return loc
 
 
-def seat_forecast(daily: xr.Dataset, halves: xr.Dataset, seat: str, *,
-                  pop: xr.DataArray | None = None,
-                  windows: dict | None = None, days: int = 5, tz: float = 8.0) -> str:
-    """The 河口镇-style block: one line per day, all four questions answered."""
-    names = [str(n) for n in daily["name"].values]
-    if seat not in names:
-        raise KeyError(f"{seat!r} is not in the township table; have {names}")
-    i = names.index(seat)
-    pid = str(daily["point"].values[i])
-    labels = [str(np.datetime64(d, "D")) for d in daily["day"].values]
-    pop_ids = [str(p) for p in pop["point"].values] if pop is not None else None
-
-    lines = []
-    for k in range(min(days, daily.sizes["day"])):
-        day = daily["day"].values[k]
-        label = labels[k]
-        day_p = float(halves["day_precip"].values[i, k])
-        night_p = float(halves["night_precip"].values[i, k])
-        day_s = float(halves["day_snow"].values[i, k])
-        night_s = float(halves["night_snow"].values[i, k])
-        text = phenomena.join_halves(
-            phenomena.half_day_text(day_p, day_s, float(halves["day_cloud"].values[i, k])),
-            phenomena.half_day_text(night_p, night_s, float(halves["night_cloud"].values[i, k])),
-        )
-        tmin = float(daily["tmin"].values[i, k])
-        tmax = float(daily["tmax"].values[i, k])
-        wind = phenomena.wind_text(
-            float(daily["wind_dir"].values[i, k]),
-            float(daily["wind_speed_min"].values[i, k]),
-            float(daily["wind_speed_max"].values[i, k]),
-            float(daily["wind_gust"].values[i, k]),
-        )
-        p = None
-        if pop is not None and pop_ids and pid in pop_ids:
-            p = float(pop.values[pop_ids.index(pid), k])
-        spans = (windows or {}).get((pid, label))
-        coverage = int(daily["hours"].values[k])
-        suffix = "" if coverage >= 24 else f"（{coverage}小时）"
-        lines.append(
-            f"{_date_label(day):<14} {_pad(text, 10)} {tmin:>3.0f}～{tmax:<3.0f}℃  "
-            f"{_pad(wind, 18)} 降水概率 {phenomena.pop_text(p):>4}   "
-            f"降水时段 {_timing(spans, p)}{suffix}"
-        )
+def seat_block(doc: dict) -> str:
+    """The county seat, one line per period."""
+    sid = doc["conclusions"].get("seat_id")
+    lines = [f"【{doc['meta'].get('seat') or '县城'}】"]
+    for q in doc["periods"]:
+        c = next((x for x in q["cells"] if x["point"] == sid), q["cells"][0])
+        tname = "最高气温" if q["kind"] == "day" else "最低气温"
+        rain = f"   降水时段 {c['windows_text']}" if c.get("windows") else ""
+        lines.append(f"{_pad(q['label'], 10)}{_pad(c['weather'], 10)}{tname} {_pad(_temp(c['temp']) + '℃', 5)}  "
+                     f"{c['wind_text']}{rain}")
     return "\n".join(lines)
 
 
-def day_blocks(daily: xr.Dataset, halves: xr.Dataset, *, pop: xr.DataArray | None = None,
-               windows: dict | None = None, days: int = 5) -> str:
-    """One block per day, one row per township — reads like a paper bulletin.
-
-    Transposed on purpose: a township-per-row / day-per-column grid needs a
-    170-character line for five days and wraps in every terminal.
-    """
-    names, z = daily["name"].values, daily["elevation"].values
-    ids = [str(p) for p in daily["point"].values]
-    pop_ids = [str(p) for p in pop["point"].values] if pop is not None else []
-    col = (f"{_pad('乡镇', 11)}{_pad('海拔', 6, '>')}  {_pad('天气', 10)}"
-           f"{_pad('气温℃', 9, '>')}  {_pad('风', 17)}{_pad('降水概率', 9, '>')}  {_pad('降水时段', 14)}")
+def date_blocks(doc: dict) -> str:
+    """One block per date, one row per township (白天 转 夜间, 夜间最低～白天最高)."""
+    names = {t["id"]: t["name"] for t in doc["townships"]}
+    elev = {t["id"]: t["elevation"] for t in doc["townships"]}
+    periods = doc["periods"]
+    col = (f"{_pad('乡镇', 12)}{_pad('海拔', 6, '>')}  {_pad('天气', 14)}{_pad('气温℃', 9, '>')}  "
+           f"{_pad('风', 26)}{_pad('降水mm', 7, '>')}")
     out = []
-    for k in range(min(days, daily.sizes["day"])):
-        day = daily["day"].values[k]
-        coverage = int(daily["hours"].values[k])
-        note = "" if coverage >= 24 else f"   （仅覆盖{coverage}小时）"
-        out += [f"── {_date_label(day)}{note} " + "─" * 8, col, "-" * len(col)]
-        for i, name in enumerate(names):
-            text = phenomena.join_halves(
-                phenomena.half_day_text(float(halves["day_precip"].values[i, k]),
-                                        float(halves["day_snow"].values[i, k]),
-                                        float(halves["day_cloud"].values[i, k])),
-                phenomena.half_day_text(float(halves["night_precip"].values[i, k]),
-                                        float(halves["night_snow"].values[i, k]),
-                                        float(halves["night_cloud"].values[i, k])),
-            )
-            wind = phenomena.wind_text(float(daily["wind_dir"].values[i, k]),
-                                       float(daily["wind_speed_min"].values[i, k]),
-                                       float(daily["wind_speed_max"].values[i, k]),
-                                       float(daily["wind_gust"].values[i, k]))
-            p = None
-            if pop is not None and ids[i] in pop_ids:
-                p = float(pop.values[pop_ids.index(ids[i]), k])
-            spans = (windows or {}).get((ids[i], str(np.datetime64(day, "D"))))
-            out.append(
-                _pad(str(name), 11) + _pad(f"{z[i]:.0f}", 6, ">") + "  "
-                + _pad(text, 10)
-                + _pad(f"{float(daily['tmin'].values[i, k]):.0f}～{float(daily['tmax'].values[i, k]):.0f}", 9, ">")
-                + "  " + _pad(wind, 17)
-                + _pad(phenomena.pop_text(p), 9, ">") + "  "
-                + _pad(_timing(spans, p), 14)
-            )
+    for d in doc["days"]:
+        day = periods[d["day"]] if d["day"] is not None else None
+        night = periods[d["night"]] if d["night"] is not None else None
+        which = "白天、夜间" if day and night else ("白天" if day else "夜间")
+        out += [f"── {_md(d['date'])} {d['weekday']}（{which}） " + "─" * 10, col, "-" * _width(col)]
+        order = sorted(names, key=lambda i: -(elev.get(i) or 0))
+        for pid in order:
+            cd = next((c for c in day["cells"] if c["point"] == pid), None) if day else None
+            cn = next((c for c in night["cells"] if c["point"] == pid), None) if night else None
+            wx = (f"{cd['weather']}转{cn['weather']}" if cd and cn and cd["weather"] != cn["weather"]
+                  else (cd or cn)["weather"])
+            lo = cn["tmin"] if cn else None
+            hi = cd["tmax"] if cd else None
+            temp = f"{_temp(lo)}～{_temp(hi)}" if cd and cn else (_temp(hi) if cd else _temp(lo))
+            if cd and cn and cd["wind_text"] != cn["wind_text"]:
+                wind = f"{cd['wind_text']}转{cn['force_text'] if cd['wind_name'] == cn['wind_name'] else cn['wind_text']}"
+            else:
+                wind = (cd or cn)["wind_text"]
+            rain = sum(c["precip"] or 0 for c in (cd, cn) if c)
+            out.append(_pad(names[pid], 12) + _pad(f"{elev.get(pid) or 0:.0f}", 6, ">") + "  " + _pad(wx, 14)
+                       + _pad(temp, 9, ">") + "  " + _pad(wind, 26) + _pad(f"{rain:.1f}" if rain >= 0.05 else "—", 7, ">"))
         out.append("")
     return "\n".join(out)
 
 
-def header(county: str, run: str, init: np.datetime64, n_points: int, n_days: int,
-           member: str, tz: float = 8.0) -> str:
-    return (
-        f"\n{county}未来{n_days}天天气预报   （{n_points}个乡镇）\n"
-        f"起报：{run}  UTC  /  北京时 {_beijing(init, tz)}      成员：{member}\n"
-        f"天气现象/气温/风：确定性成员（ECMWF IFS + GFS 加权）；"
-        f"降水概率：集合成员中日降水量≥{TRACE_MM:g}mm 的比例\n"
-        + "═" * 104
-    )
+def render(doc: dict) -> str:
+    m = doc["meta"]
+    head = (f"\n{m['county']}未来五天天气预报   （{m['n_townships']}个乡镇）\n"
+            f"发布：{_issue_text(m)}（北京时）   起报：{m['run']} UTC   成员：{m['member']}\n"
+            + "═" * 96)
+    alerts = doc["conclusions"].get("alerts") or []
+    warn = ""
+    if alerts:
+        rows = []
+        for a in alerts:
+            lvl = a["level"] if a["level"] == "关注" else f"达{a['level']}预警标准"
+            rows.append(f"  {_md(a['date'])} {a['type']}（{lvl}）：{a['detail']}")
+        warn = "\n提示（据模式预报，非气象部门发布的预警信号）：\n" + "\n".join(rows) + "\n"
+    return "\n".join([head, doc["conclusions"]["headline"], warn, seat_block(doc), "", date_blocks(doc)])

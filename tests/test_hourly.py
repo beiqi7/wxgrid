@@ -335,21 +335,30 @@ def pub(tmp_path, monkeypatch):
     csv = tmp_path / "t.csv"
     csv.write_text("id,name,lat,lon,elevation_m\nA,甲镇,28.3,117.7,60\n", encoding="utf-8")
     calls = []
-    monkeypatch.setattr(publish.pipeline, "common_run", lambda *a, **k: Run.from_stamp("2026092800"))
+    first = {"start": "2026-09-28T20:00"}  # the planned first period; tests move it
+    run = Run.from_stamp("2026092800")
+
+    def fake_choose(*a, **k):
+        from wxgrid.periods import Period
+        return run, [Period("night", first["start"][:10], 12, 24, first["start"], "2026-09-29T08:00")]
+
+    monkeypatch.setattr(product, "choose_run", fake_choose)
 
     def fake_bundle(pts, **kw):
         calls.append(kw)
-        meta = {"county": "测试县", "run": "2026092800", "generated": "2026-09-28T09:00:00+00:00"}
-        return {"meta": meta}, ({"meta": meta, "points": {}} if kw.get("hourly") else None)
+        meta = {"county": "测试县", "run": "2026092800", "generated": "2026-09-28T09:00:00+00:00",
+                "schema": product.SCHEMA}
+        doc = {"meta": meta, "periods": [{"start_local": first["start"]}]}
+        return doc, ({"meta": meta, "points": {}} if kw.get("hourly") else None)
 
     monkeypatch.setattr(product, "compute_bundle", fake_bundle)
     monkeypatch.setattr(publish, "session", lambda: object())
     kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "data"))
-    return tmp_path / "data", kw, calls
+    return tmp_path / "data", kw, calls, first
 
 
 def test_publish_skips_a_cycle_already_on_disk_without_computing(pub):
-    data, kw, calls = pub
+    data, kw, calls, _ = pub
     publish.publish_once(**kw)
     assert len(calls) == 1
     assert (data / "hourly" / "测试县_2026092800.json").exists()
@@ -358,8 +367,27 @@ def test_publish_skips_a_cycle_already_on_disk_without_computing(pub):
     assert len(calls) == 1, "second run on the same cycle must not download anything"
 
 
+def test_publish_recomputes_when_the_same_cycle_is_issued_for_a_later_period(pub):
+    """07:30 and 19:30 can land on the same cycle; the evening product must start at 今天夜间."""
+    data, kw, calls, first = pub
+    publish.publish_once(**kw)
+    first["start"] = "2026-09-29T08:00"
+    publish.publish_once(**kw)
+    assert len(calls) == 2
+
+
+def test_publish_recomputes_an_old_format_product(pub):
+    data, kw, calls, _ = pub
+    (data / "runs").mkdir(parents=True)
+    (data / "hourly").mkdir(parents=True)
+    (data / "runs" / "测试县_2026092800.json").write_text('{"meta":{"run":"2026092800"},"days":[]}', encoding="utf-8")
+    (data / "hourly" / "测试县_2026092800.json").write_text("{}", encoding="utf-8")
+    publish.publish_once(**kw)
+    assert len(calls) == 1
+
+
 def test_publish_backfills_hourly_for_an_older_product(pub):
-    data, kw, calls = pub
+    data, kw, calls, _ = pub
     publish.publish_once(**kw, hourly=False)
     assert len(calls) == 1 and not (data / "hourly" / "测试县_2026092800.json").exists()
     publish.publish_once(**kw)
@@ -367,7 +395,7 @@ def test_publish_backfills_hourly_for_an_older_product(pub):
 
 
 def test_publish_drops_orphan_hourly_files_and_stale_cache(pub, monkeypatch, tmp_path):
-    data, kw, _ = pub
+    data, kw, _, _ = pub
     cache = tmp_path / "cache"
     cache.mkdir()
     old, fresh = cache / "old.grib2", cache / "fresh.grib2"

@@ -6,9 +6,9 @@ Before=slices.target
 [Slice]
 # Whole box is 4 cores / 8 GB. Everything wxgrid runs (the twice-daily publish,
 # the web server, and any manual `systemd-run --slice=wxgrid.slice ...`) shares
-# this ceiling: 30 % of the CPU and 50 % of the memory, combined.
+# this ceiling: 30 % of the CPU and 66 % of the memory (5.2 of 7.9 GB), combined.
 CPUQuota=120%
 CPUWeight=20
-MemoryHigh=3500M
-MemoryMax=4G
+MemoryHigh=4800M
+MemoryMax=5200M
 TasksMax=160

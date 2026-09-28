@@ -31,6 +31,26 @@ def local_day_bounds(init_time: np.datetime64, days: np.ndarray, tz_hours: float
     return np.stack([starts, starts + 24], axis=1)
 
 
+def window_pop(ens: EnsemblePrecip, start_utc_h: np.ndarray, end_utc_h: np.ndarray, *,
+               threshold_mm: float = TRACE_MM) -> np.ndarray:
+    """``(point, window)`` % of members with >= ``threshold_mm`` in each window.
+
+    Windows are absolute UTC hours (hours since the epoch), so the ensemble may be
+    on another cycle than the deterministic run. A window the ensemble does not
+    fully cover is NaN rather than a probability over part of it.
+    """
+    init_h = int(np.datetime64(ens.init_time, "h").astype(int))
+    bounds = np.stack([np.asarray(start_utc_h) - init_h, np.asarray(end_utc_h) - init_h], axis=1)
+    totals = _member_daily(ens, bounds)  # (member, point, window)
+    covered = np.zeros(bounds.shape[0])
+    for j in range(ens.mm.shape[2]):
+        b0, b1 = float(ens.starts_h[j]), float(ens.ends_h[j])
+        covered += np.clip(np.minimum(b1, bounds[:, 1]) - np.maximum(b0, bounds[:, 0]), 0, None)
+    out = (totals >= threshold_mm).mean(axis=0) * 100.0
+    out[:, covered < (bounds[:, 1] - bounds[:, 0]) - 1e-6] = np.nan
+    return out
+
+
 def _member_daily(ens: EnsemblePrecip, bounds: np.ndarray) -> np.ndarray:
     """``(member, point, day)`` daily totals, splitting straddling buckets."""
     n_day = bounds.shape[0]
