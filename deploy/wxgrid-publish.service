@@ -1,0 +1,45 @@
+[Unit]
+Description=wxgrid — compute and publish the township forecast product
+Documentation=file:/opt/wxgrid/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/wxgrid
+Environment=PYTHONUNBUFFERED=1
+Environment=WXGRID_CACHE=/var/lib/wxgrid/cache
+ExecStart=/usr/bin/python3 -m wxgrid publish \
+    --townships /opt/wxgrid/yanshan_townships.csv \
+    --county 铅山县 --seat 河口镇 \
+    --data-dir /var/lib/wxgrid \
+    --days 5 --workers 2 --keep 60
+
+# One cycle is ~10 min wall / ~2 min CPU. Kill it well before the next timer.
+TimeoutStartSec=45min
+
+# --- resource envelope: stay near 30 % of a 4-core / 8 GB box ---
+Nice=15
+CPUQuota=120%
+CPUWeight=20
+IOSchedulingClass=idle
+IOWeight=20
+MemoryHigh=1200M
+MemoryMax=2G
+TasksMax=64
+
+# --- hardening: it only needs to read /opt/wxgrid and write its data dir ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/wxgrid
+
+[Install]
+WantedBy=multi-user.target

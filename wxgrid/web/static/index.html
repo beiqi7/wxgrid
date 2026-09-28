@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wxgrid · 乡镇精细化预报</title>
+<link rel="preconnect" href="/">
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="/static/favicon.svg">
+</head>
+<body>
+<div id="bg-aurora" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div class="brand-txt">
+      <strong>wxgrid</strong>
+      <small>乡镇精细化天气预报</small>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <select id="run-select" class="run-select" title="选择起报时次" aria-label="选择起报时次"></select>
+    <button id="theme-toggle" class="icon-btn" title="切换主题" aria-label="切换主题"></button>
+    <a class="icon-btn" href="#api" title="API 文档" aria-label="API 文档">API</a>
+  </div>
+</header>
+
+<main id="app">
+  <section id="hero" class="hero card is-loading" aria-live="polite">
+    <div class="hero-skeleton">加载中…</div>
+  </section>
+
+  <section id="alerts" class="alerts" hidden></section>
+
+  <section class="section" id="days-section">
+    <h2 class="sec-title">未来五天 · 县城</h2>
+    <div id="day-strip" class="day-strip"></div>
+  </section>
+
+  <section class="section grid-2">
+    <div class="card chart-card">
+      <div class="card-head">
+        <h3>各乡镇气温区间</h3>
+        <div class="seg" id="temp-day-seg" role="tablist" aria-label="选择日期"></div>
+      </div>
+      <div id="temp-chart" class="chart"></div>
+    </div>
+    <div class="card chart-card">
+      <div class="card-head">
+        <h3>各乡镇日降水量</h3>
+        <div class="seg" id="precip-day-seg" role="tablist" aria-label="选择日期"></div>
+      </div>
+      <div id="precip-chart" class="chart"></div>
+    </div>
+  </section>
+
+  <section class="section grid-2">
+    <div class="card map-card">
+      <div class="card-head">
+        <h3>乡镇分布</h3>
+        <div class="seg" id="map-metric-seg" role="tablist" aria-label="选择着色量"></div>
+      </div>
+      <div id="map" class="map"></div>
+      <div id="map-legend" class="map-legend"></div>
+    </div>
+    <div class="card table-card">
+      <div class="card-head">
+        <h3>乡镇明细</h3>
+        <div class="seg" id="table-day-seg" role="tablist" aria-label="选择日期"></div>
+      </div>
+      <div class="table-wrap"><table id="town-table"></table></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="card text-card">
+      <div class="card-head">
+        <h3>预报文稿</h3>
+        <button id="copy-text" class="ghost-btn">复制</button>
+      </div>
+      <pre id="bulletin-text" class="bulletin"></pre>
+    </div>
+  </section>
+
+  <section class="section" id="api">
+    <div class="card api-card">
+      <div class="card-head"><h3>只读 API</h3><span class="muted">数据与结论获取，无需鉴权</span></div>
+      <div id="api-list" class="api-list"></div>
+    </div>
+  </section>
+</main>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-inner card">
+    <button id="drawer-close" class="icon-btn drawer-close" aria-label="关闭">×</button>
+    <div id="drawer-body"></div>
+  </div>
+</div>
+
+<footer class="footer">
+  <span>ECMWF IFS + NOAA GFS 加权降尺度 · GEFS 集合降水概率</span>
+  <span id="foot-meta" class="muted"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -281,11 +281,32 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--min-obs", type=int, default=20)
     c.add_argument("--out", required=True)
     c.set_defaults(func=cmd_calibrate)
+
+    pub = sub.add_parser("publish", add_help=False,
+                         help="compute a product and store it under --data-dir (see `publish --help`)")
+    pub.set_defaults(func=lambda a: _delegate("publish", a))
+
+    srv = sub.add_parser("serve", add_help=False,
+                         help="serve the read-only API + web UI (see `serve --help`)")
+    srv.set_defaults(func=lambda a: _delegate("serve", a))
     return p
 
 
+def _delegate(name: str, args) -> int:
+    """Hand the remaining argv to the submodule's own parser."""
+    rest = list(getattr(args, "_rest", []))
+    if name == "publish":
+        from . import publish as publish_mod
+        return publish_mod.main(rest)
+    from .web import app as web_app
+    return web_app.main(rest)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args, rest = build_parser().parse_known_args(argv)
+    args._rest = rest
+    if rest and args.command not in ("publish", "serve"):
+        raise SystemExit(f"unrecognised arguments: {' '.join(rest)}")
     return args.func(args)
 
 

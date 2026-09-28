@@ -1,0 +1,17 @@
+[Unit]
+Description=wxgrid — twice-daily forecast publish (Beijing time)
+Documentation=file:/opt/wxgrid/README.md
+
+[Timer]
+# ECMWF open data for 00Z lands ~06:30 BJT and 12Z ~18:30 BJT; fire after each so
+# the newest settled cycle is available. The job itself skips a cycle already on disk.
+# systemd wants the timezone last; this box is already CST (+0800).
+OnCalendar=*-*-* 07:30:00 Asia/Shanghai
+OnCalendar=*-*-* 19:30:00 Asia/Shanghai
+# Spread load and recover a firing missed while the box was down.
+RandomizedDelaySec=10min
+Persistent=yes
+Unit=wxgrid-publish.service
+
+[Install]
+WantedBy=timers.target

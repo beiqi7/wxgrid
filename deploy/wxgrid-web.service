@@ -1,0 +1,40 @@
+[Unit]
+Description=wxgrid — read-only forecast API + web UI
+Documentation=file:/opt/wxgrid/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wxgrid
+Environment=PYTHONUNBUFFERED=1
+# Bound to loopback by default: the API is unauthenticated, so expose it through
+# the existing reverse proxy (TLS + any access control) rather than 0.0.0.0.
+ExecStart=/usr/bin/python3 -m wxgrid serve --host 127.0.0.1 --port 8790 --data-dir /var/lib/wxgrid
+Restart=on-failure
+RestartSec=5s
+
+# It only reads JSON off disk, so it stays tiny.
+Nice=10
+CPUQuota=25%
+MemoryHigh=192M
+MemoryMax=384M
+TasksMax=64
+
+# Hardening: no writes anywhere, data dir read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/var/lib/wxgrid
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
