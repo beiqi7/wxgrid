@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>乡镇天气预报</title>
-<meta name="description" content="乡镇级精细化天气预报：白天/夜间五天预报与未来三天逐3小时预报，ECMWF IFS + NOAA GFS 降尺度融合">
+<meta name="description" content="乡镇级精细化天气预报：白天/夜间五天预报与未来三天逐3小时预报，8 家全球模式融合并用周边国家站实况订正">
 <link rel="icon" href="/static/favicon.svg">
 <link rel="stylesheet" href="/static/styles.css">
 <!-- apply the saved theme before first paint so night mode does not flash white -->
@@ -26,6 +26,7 @@
       <a href="#h-days">五天</a>
       <a href="#h-towns">乡镇</a>
       <a href="#h-method">方法</a>
+      <a href="#h-acc">检验</a>
     </nav>
     <div class="bar-right">
       <select id="runs" class="runs" aria-label="选择起报时次" hidden></select>
@@ -92,65 +93,40 @@
       <p class="bsub">这份预报从哪来、怎么算、哪里靠不住</p>
     </div>
 
-    <div class="sources">
-      <article class="src">
-        <p class="src-tag">确定性 · 权重 <b id="w-ec">0.6</b></p>
-        <h3>ECMWF IFS</h3>
-        <p class="src-spec">0.25° 约 28 km · 3 小时一步至 144 小时</p>
-        <p>欧洲中期天气预报中心的全球模式，公认中期预报技巧最高。取开放数据的 00/12 时（UTC）起报。</p>
-      </article>
-      <article class="src">
-        <p class="src-tag">确定性 · 权重 <b id="w-gfs">0.4</b></p>
-        <h3>NOAA GFS</h3>
-        <p class="src-spec">0.25° 约 28 km · 与 IFS 同一起报时次</p>
-        <p>美国国家环境预报中心的全球模式。同化与物理过程与 IFS 不同，两者误差部分互补，融合比任一单独更稳。</p>
-      </article>
-      <article class="src">
-        <p class="src-tag">集合 · <b id="w-mem">21</b> 个成员 · 仅用于明细</p>
-        <h3>NOAA GEFS</h3>
-        <p class="src-spec">0.5° · 6 小时降水</p>
-        <p>同一模式扰动初值跑 21 次，得出各时段有雨的成员比例。只列在明细表里，不进入预报用语。</p>
-      </article>
-      <article class="src">
-        <p class="src-tag">地形</p>
-        <h3>Copernicus DEM</h3>
-        <p class="src-spec">GLO-30 · 约 30 m</p>
-        <p>欧空局全球数字高程。给每个乡镇政府驻地取真实海拔，用来订正模式地形带来的气温偏差。</p>
-      </article>
-    </div>
+    <div class="sources" id="sources"></div>
 
     <ol class="steps">
-      <li><b>取数</b><span>按 GRIB 索引只取所需的约 10 个地面要素，每个时次几 MB，不下载整份 500 MB 文件。</span></li>
-      <li><b>降尺度</b><span>双线性插值到乡镇坐标；气温按递减率订正到实际海拔，风和降水不做地形假设。</span></li>
-      <li><b>融合</b><span>两家模式各自降尺度到乡镇后再加权，避免在粗网格上混合抹掉海拔信号；风向由融合后的 u/v 重算。</span></li>
-      <li><b>分时段</b><span>按北京时 08—20 时为白天、20—次日 08 时为夜间，各含 4 个 3 小时窗口；白天取最高气温，夜间取最低。</span></li>
-      <li><b>用语</b><span>降水按 12 小时国标等级，风按蒲福风级，天空分晴、多云、阴；阵风达 6 级以上才注明。</span></li>
-      <li><b>提示</b><span>按暴雨、大风、高温预警信号的标准（3/6/12 小时雨量、平均风与阵风、连续高温）检查模式预报。</span></li>
+      <li><b>取数</b><span>向 Open-Meteo 取 8 家全球模式在每个乡镇（按真实海拔）的逐小时预报，一次请求约 200 KB。</span></li>
+      <li><b>融合</b><span>8 家等权平均：各家误差来源不同，平均后互相抵消，比任何单家都稳。风按 u/v 分量平均。</span></li>
+      <li><b>分时段</b><span>北京时 08—20 时为白天、20—次日 08 时为夜间；白天最高、夜间最低取各家自己的极值再平均。</span></li>
+      <li><b>气温订正</b><span>用周边 7 个国家站过去 60 天的实况，按白天/夜间、预报第几天分别算系统偏差，逐日滚动更新后扣除。</span></li>
+      <li><b>降水订正</b><span>把 12 小时雨量按"预报气候 → 实况气候"做分位数映射：去掉平均带来的毛毛雨，把偏弱的大雨调回来。</span></li>
+      <li><b>用语与提示</b><span>降水按 12 小时国标等级，风按蒲福风级；按暴雨、大风、高温预警信号标准检查，给出提示。</span></li>
     </ol>
 
     <div class="formulas">
       <figure class="fx">
-        <figcaption>气温海拔订正</figcaption>
-        <p class="eq">T<sub>乡镇</sub> = T<sub>格点</sub> + γ · (z<sub>乡镇</sub> − z<sub>格点</sub>)</p>
-        <p class="fx-note">γ = −6.5 K/km（标准大气递减率），订正幅度上限 ±10 K。高于模式地形的乡镇降温，低于的升温。</p>
+        <figcaption>多模式平均</figcaption>
+        <p class="eq">X̄ = <sup>1</sup>⁄<sub>n</sub> Σ<sub>k</sub> X<sub>k</sub>　（n = 8）</p>
+        <p class="fx-note">某家模式时效不够（ARPEGE 约 4 天、GRAPES 约 5.5 天）时自动退出，少于 3 家的时次不出预报。</p>
       </figure>
       <figure class="fx">
-        <figcaption>多模式融合</figcaption>
-        <p class="eq">X = <span id="f-wec">0.6</span> · X<sub>ECMWF</sub> + <span id="f-wgfs">0.4</span> · X<sub>GFS</sub></p>
-        <p class="fx-note">对气温、降水、云量、u/v 风分量逐项加权。权重是先验；有本地站点检验后按 1/MSE 重定。</p>
+        <figcaption>气温偏差（逐日滚动）</figcaption>
+        <p class="eq">b ← (1 − α) b + α · (F − O)</p>
+        <p class="eq eq-2">T′ = T − b<sub>时段, 第 d 天</sub>　（α = 0.1）</p>
+        <p class="fx-note">偏差只用预报发出之前已知的误差，7 个站合并计算，避免单站噪声；上限 ±4 ℃。</p>
       </figure>
       <figure class="fx">
-        <figcaption>白天 / 夜间</figcaption>
-        <p class="eq">T<sub>白天</sub> = max T<sub>max,3h</sub>(08—20)</p>
-        <p class="eq eq-2">T<sub>夜间</sub> = min T<sub>min,3h</sub>(20—08)</p>
-        <p class="fx-note">用模式自带的 3 小时窗口极值（ECMWF mx2t3/mn2t3、GFS TMAX/TMIN），不是 3 小时一次的瞬时值，否则会抹平日较差。</p>
+        <figcaption>降水分位数映射</figcaption>
+        <p class="eq">P′ = F<sub>实况</sub><sup>−1</sup>( F<sub>预报</sub>(P) )</p>
+        <p class="fx-note">按白天、夜间分别拟合；时段内各 3 小时雨量同比例缩放，时段总量与逐3小时一致。</p>
       </figure>
     </div>
 
     <div class="why">
       <h3>为什么是逐3小时，不是逐小时</h3>
-      <p>ECMWF 开放数据本身就是 3 小时一步。逐小时的数值只能靠插值或借用 GFS 一家的日内形态来"补"，气温曲线尚可，
-        阵性降水落在哪个钟点基本没有把握。所以页面只展示原生的 3 小时分辨率、到 72 小时为止；
+      <p>多数全球模式原生就是 3 小时（有的 6 小时）一步，格距 9—28 km。逐小时的数值只能插值得到，气温曲线尚可，
+        阵性降水落在哪个钟点基本没有把握；检验也只能在 3 小时、12 小时尺度上做。所以页面只到逐3小时、72 小时为止，
         再往后用白天 / 夜间两个时段表达，与气象台城镇预报的做法一致。</p>
     </div>
 
@@ -169,16 +145,26 @@
     <div class="limits">
       <h3>局限，请一并看</h3>
       <ul>
-        <li>0.25° 一格约 28 km，全县只落在十几个格点上，相邻乡镇的差异主要来自海拔订正，而不是模式本身分辨出的差别。</li>
-        <li>全球模式在小雨量上普遍偏多（"毛毛雨偏差"），零点几毫米的"小雨"实际常常没下。</li>
-        <li>山谷冷空气堆积、迎风坡增雨、城镇热岛，靠递减率订正体现不出来。</li>
-        <li>0.6 / 0.4 的融合权重是经验先验；站点检验结果见下方准确性说明。</li>
+        <li>订正所用的 7 个国家站（武夷山、邵武、浦城、南城、景德镇、衢州、南昌）都不在县内；最近的武夷山站在南面约 50 km。
+          县城附近的上饶站不参与国际交换，拿不到实况。订正的是这一片区的共同偏差，单个乡镇的小气候（山谷冷空气、迎风坡增雨）仍体现不出来。</li>
+        <li>检验窗口只有最近 30 天，且只覆盖夏末到初秋；换季时偏差会变，滚动订正需要一两周才能跟上。</li>
+        <li>模式数据经 Open-Meteo 取得（CC BY 4.0，非商业免费）；取不到时自动退回 ECMWF + GFS 原始 GRIB 方案，那时不做站点订正。</li>
+        <li>明细表里的降水概率是 8 家模式中（各自订正后）有雨的比例，只有 8 档，是粗略的；它不进入预报用语。</li>
         <li>全自动生成，未经预报员订正，不能替代气象部门发布的预报和预警信号。</li>
       </ul>
     </div>
   </section>
 
-  <!-- 7. secondary material, folded -->
+  <!-- 7. verification -->
+  <section class="band" aria-labelledby="h-acc">
+    <div class="bhead">
+      <h2 id="h-acc" class="btitle">准确性检验</h2>
+      <p id="acc-sub" class="bsub"></p>
+    </div>
+    <div id="acc" class="acc"></div>
+  </section>
+
+  <!-- 8. secondary material, folded -->
   <section class="band">
     <details class="fold">
       <summary><span>预报文稿</span><span class="fold-hint">与命令行输出一致的纯文本</span></summary>

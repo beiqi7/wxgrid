@@ -27,6 +27,7 @@ import time
 from typing import Any
 
 from . import daily as daily_mod
+from . import periods as periods_mod
 from . import points as points_mod
 from . import product
 from .sources._fetch import session
@@ -57,6 +58,7 @@ def _rebuild_index(data_dir: pathlib.Path) -> list[dict]:
         entries.append({"file": p.name, "county": meta.get("county"), "run": meta.get("run"),
                         "init_time": meta.get("init_time"), "generated": meta.get("generated"),
                         "member": meta.get("member"), "days": meta.get("days"),
+                        "engine": meta.get("engine"), "issue_local": meta.get("issue_local"),
                         "hourly": (data_dir / "hourly" / p.name).exists()})
     entries.sort(key=lambda e: (e.get("generated") or "", e.get("run") or ""), reverse=True)
     _atomic_write_json(data_dir / "index.json", entries)
@@ -104,7 +106,8 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
                  days: int = 5, every: int = 3, sources: str = "ecmwf,gfs", member: str = "blend",
                  tz: float = daily_mod.TZ_CHINA, want_pop: bool = True, workers: int = 4,
                  keep: int = 60, min_age_hours: float | None = None,
-                 force: bool = False, hourly: bool = True, issue_utc=None, sess=None) -> pathlib.Path:
+                 force: bool = False, hourly: bool = True, issue_utc=None, sess=None,
+                 engine: str = "multimodel") -> pathlib.Path:
     """Compute one product (and its hourly series) and store it. Returns the run file path.
 
     Resolves the cycle and the forecast periods first (they depend on the issue
@@ -122,10 +125,16 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
     src = tuple(sources.split(","))
 
     issue = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    run, plan = product.choose_run(src, issue, n_days=days, tz=tz, sess=sess, min_age_hours=min_age_hours)
-    out = data / "runs" / f"{_slug(county)}_{run.stamp}.json"
+    if engine == "multimodel":
+        init = product.virtual_init(issue)
+        stamp, first = init.strftime("%Y%m%d%H"), periods_mod.plan(init, issue, tz=tz, n_days=days)[0].start_local
+        run = None
+    else:
+        run, plan = product.choose_run(src, issue, n_days=days, tz=tz, sess=sess, min_age_hours=min_age_hours)
+        stamp, first = run.stamp, plan[0].start_local
+    out = data / "runs" / f"{_slug(county)}_{stamp}.json"
     hourly_out = data / "hourly" / out.name
-    if not force and _is_current(out, plan[0].start_local) and (hourly_out.exists() or not hourly):
+    if not force and _is_current(out, first) and (hourly_out.exists() or not hourly):
         # Same cycle, same first period, current format: nothing to download.
         _refresh_pointers(data, keep)
         return out
@@ -133,7 +142,11 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
     prod, hdoc = product.compute_bundle(pts, county=county, seat=seat, days=days, every=every,
                                         sources=src, member=member, tz=tz, want_pop=want_pop,
                                         workers=workers, min_age_hours=min_age_hours, run=run,
-                                        issue_utc=issue, sess=sess, hourly=hourly)
+                                        issue_utc=issue, sess=sess, hourly=hourly, engine=engine,
+                                        verify_root=data / "verify")
+    # the multi-model engine may have fallen back to a GRIB cycle with another stamp
+    out = data / "runs" / f"{_slug(county)}_{prod['meta']['run']}.json"
+    hourly_out = data / "hourly" / out.name
     if hdoc is not None:  # hourly first: the index marks a run hourly only once both exist
         _atomic_write_json(hourly_out, hdoc)
     _atomic_write_json(out, prod)
@@ -203,6 +216,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--keep", type=int, default=60)
     p.add_argument("--min-age-hours", type=float, default=None)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--engine", choices=product.ENGINES, default="multimodel",
+                   help="multimodel: 8 models via Open-Meteo + station calibration (default); "
+                        "grib: ECMWF IFS + GFS from the open GRIB archives")
     p.add_argument("--no-hourly", action="store_true",
                    help="skip the hourly series (saves ~80 lean GFS reads per cycle)")
     p.add_argument("--loop", action="store_true", help="run forever on the daily schedule")
@@ -213,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     kw = dict(townships=args.townships, county=args.county, seat=args.seat, data_dir=args.data_dir,
               days=args.days, every=args.every, sources=args.sources, member=args.member,
               tz=args.tz, want_pop=not args.no_pop, workers=args.workers, keep=args.keep,
-              min_age_hours=args.min_age_hours, force=args.force, hourly=not args.no_hourly)
+              min_age_hours=args.min_age_hours, force=args.force, hourly=not args.no_hourly,
+              engine=args.engine)
     if args.loop:
         hours = tuple(int(x) for x in args.at.split(","))
         serve_schedule(hours=hours, tz=args.tz, **kw)

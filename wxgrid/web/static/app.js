@@ -196,6 +196,18 @@ function glyph(text, size, night = false) {
     aria-hidden="true" focusable="false">${GLYPH[k]}</svg>`;
 }
 
+/** How the detail probability was made, for the table footnotes. */
+function popNote(threeHourly) {
+  const m = S.doc.meta;
+  if (m.pop_source === 'multimodel') {
+    return `降水概率为 ${m.pop_members || 8} 家模式中（各自订正后）${threeHourly ? '该 3 小时' : '该时段'}有 ≥0.1 mm 降水的比例，仅作明细参考。`;
+  }
+  if (m.pop_source === 'gefs' || m.pop_members) {
+    return `降水概率为 NOAA GEFS ${m.pop_members || 21} 个成员中${threeHourly ? '所在 6 小时' : '该时段'}有 ≥0.1 mm 降水的比例，仅作明细参考。`;
+  }
+  return '本次没有降水概率。';
+}
+
 /* ---------- 1. hero: this period and the next, at the county seat ---------- */
 function periodCard(q, cls) {
   const c = cellOf(q, seatId()) || q.cells[0];
@@ -246,8 +258,9 @@ function renderToday() {
       <p class="t-sum">未来五天</p>
       <p class="t-say">${esc(S.doc.conclusions.headline)}</p>
       <p class="t-src">
-        ${issued ? `<b>${esc(issued)}</b> 发布 · ` : ''}起报 <b>${esc(m.run)}</b> UTC
-        · ${esc((m.sources || []).map(s => ({ ecmwf: 'ECMWF IFS', gfs: 'NOAA GFS' }[s] || s)).join(' + '))} 融合
+        ${issued ? `<b>${esc(issued)}</b> 发布` : ''}${m.engine === 'multimodel' ? '' : ` · 起报 <b>${esc(m.run)}</b> UTC`}
+        · ${m.engine === 'multimodel' ? `${(m.sources || []).length} 家模式融合${m.calibration ? ' + 站点订正' : ''}`
+          : esc((m.sources || []).map(s => ({ ecmwf: 'ECMWF IFS', gfs: 'NOAA GFS' }[s] || s)).join(' + ')) + ' 融合'}
         · ${m.n_townships} 个乡镇
       </p>
     </div>`;
@@ -393,7 +406,7 @@ function table3h(rows, id) {
         <th scope="col">风</th><th scope="col">阵风 m/s</th><th scope="col">云量</th><th scope="col">降水概率</th></tr></thead>
       <tbody>${body}</tbody>
     </table></div>
-    <p class="ht-api">气温、风为该时刻的值，天气与降水为前 3 小时；降水概率取所在 6 小时时段的集合预报（GEFS）有雨成员比例。
+    <p class="ht-api">气温、风为该时刻的值，天气与降水为前 3 小时；${esc(popNote(true))}
       数据：<a href="${esc(href)}" target="_blank" rel="noopener">GET ${esc(href)}</a></p>
   </details>`;
 }
@@ -604,7 +617,7 @@ function openSheet(id, from) {
         <th scope="col">降水</th><th scope="col">降水时段</th><th scope="col">降水概率</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <p class="ht-api">降水概率为 GEFS 集合预报在该时段有 ≥0.1 mm 降水的成员比例，仅作明细参考。
+    <p class="ht-api">${esc(popNote(false))}
       数据：<a href="${esc(href)}" target="_blank" rel="noopener">GET ${esc(href)}</a></p>`;
 
   S.back = from || document.activeElement;
@@ -636,13 +649,87 @@ function trapFocus(e) {
 }
 
 /* ---------- method, bulletin, API ---------- */
+/* Model cards: what actually went into the product on screen. */
+const MODEL_INFO = {
+  ecmwf_ifs: ['ECMWF IFS', '欧洲中期天气预报中心', '9 km · 逐小时至 90 h，其后 3 h', '公认中期预报技巧最高的物理模式。'],
+  ecmwf_aifs025_single: ['ECMWF AIFS', '欧洲中期天气预报中心', '0.25° · 6 h', 'ECMWF 的 AI 模式，用再分析训练的图神经网络。'],
+  icon_global: ['DWD ICON', '德国气象局', '13 km · 逐小时至 78 h', '非静力物理模式，本地检验气温最准的单家之一。'],
+  ukmo_global_deterministic_10km: ['UKMO', '英国气象局', '10 km · 逐小时', '统一模式（Unified Model）全球版。'],
+  cma_grapes_global: ['CMA GRAPES', '中国气象局', '0.125° · 3 h · 约 5.5 天', '我国自主研发的全球同化预报系统。'],
+  gem_global: ['CMC GEM', '加拿大气象局', '15 km · 3 h', '加拿大全球环境多尺度模式。'],
+  meteofrance_arpege_world: ['ARPEGE', '法国气象局', '0.25° · 约 4 天', '法国全球谱模式。'],
+  ncep_aigfs025: ['NOAA AIGFS', '美国国家环境预报中心', '0.25° · 6 h', 'NOAA 的 AI 全球模式。'],
+  ecmwf: ['ECMWF IFS', '欧洲中期天气预报中心', '0.25° · 3 h', '开放数据 GRIB，本地降尺度。'],
+  gfs: ['NOAA GFS', '美国国家环境预报中心', '0.25° · 逐小时至 120 h', '开放数据 GRIB，本地降尺度。'],
+};
 function renderMethod() {
-  const label = S.doc.meta.source_label || '';
-  const w = (re, dflt) => { const m = label.match(re); return m ? Number(m[1]).toFixed(1) : dflt; };
-  const wec = w(/ecmwf[^:]*:([\d.]+)/, '0.6'), wgfs = w(/gfs[^:]*:([\d.]+)/, '0.4');
-  $('w-ec').textContent = wec; $('f-wec').textContent = wec;
-  $('w-gfs').textContent = wgfs; $('f-wgfs').textContent = wgfs;
-  $('w-mem').textContent = S.doc.meta.pop_members || 21;
+  const m = S.doc.meta;
+  const multi = m.engine === 'multimodel';
+  const cards = (m.sources || []).map(id => {
+    const [name, org, spec, note] = MODEL_INFO[id] || [id, '', '', ''];
+    return `<article class="src"><p class="src-tag">${esc(org)}</p><h3>${esc(name)}</h3>
+      <p class="src-spec">${esc(spec)}</p><p>${esc(note)}</p></article>`;
+  });
+  if (m.pop_source !== 'multimodel') {
+    cards.push(`<article class="src src-aux"><p class="src-tag">明细用 · ${m.pop_members || 21} 个成员</p><h3>NOAA GEFS</h3>
+      <p class="src-spec">0.5° · 6 h 降水</p><p>集合预报，只用来给明细表算降水概率。</p></article>`);
+  }
+  cards.push(`<article class="src src-aux"><p class="src-tag">订正用 · 7 个国家站</p><h3>SYNOP 实况</h3>
+    <p class="src-spec">每 3 小时 · 经 OGIMET 转发</p><p>武夷山、邵武、浦城、南城、景德镇、衢州、南昌的气温、降水实况。</p></article>`);
+  $('sources').innerHTML = cards.join('');
+  $('sources').classList.toggle('grib', !multi);
+}
+
+/* ---------- accuracy: out-of-sample verification against the stations ---------- */
+function renderAccuracy() {
+  const v = S.doc.verification;
+  const box = $('acc');
+  if (!v || v.error || !v.configs) {
+    $('acc-sub').textContent = '';
+    box.innerHTML = '<p class="hr-empty">还没有足够的检验样本。</p>';
+    return;
+  }
+  $('acc-sub').textContent = `${md(v.window[0])}—${md(v.window[1])} · ${v.days} 天 · 周边 ${v.stations.length} 个国家站 · 全部为样本外成绩`;
+  const order = ['new', 'new_raw', 'old', 'ecmwf'];
+  const leads = ['1', '2', '3', '4', '5'];
+  const get = (c, l) => c.scores[l] || c.scores[Number(l)];
+  const metric = [
+    ['白天最高气温', 'tmax', 'acc2', '误差 ≤2 ℃ 的比例', '%', true],
+    ['夜间最低气温', 'tmin', 'acc2', '误差 ≤2 ℃ 的比例', '%', true],
+    ['晴雨', 'rain', 'pc', '12 小时有无降水判对的比例', '%', true],
+    ['降水 TS', 'rain', 'ts', '有雨时段的命中评分', '', true],
+    ['中雨以上 TS', 'rain5', 'ts', '12 小时 ≥5 mm 的命中评分', '', true],
+  ];
+  const best = {};
+  for (const [, v1, v2] of metric) for (const l of leads) {
+    const vals = order.map(k => v.configs[k] ? (get(v.configs[k], l)[v1] || {})[v2] : null).filter(Number.isFinite);
+    best[`${v1}.${v2}.${l}`] = Math.max(...vals);
+  }
+  const rows = metric.map(([label, v1, v2, hint, unit]) => `
+    <tr class="acc-h"><th scope="rowgroup" colspan="6">${label}<small>${hint}</small></th></tr>
+    ${order.filter(k => v.configs[k]).map(k => {
+      const c = v.configs[k];
+      return `<tr class="${k === 'new' ? 'on' : ''}"><th scope="row">${esc(c.label)}</th>${leads.map(l => {
+        const x = (get(c, l)[v1] || {})[v2];
+        const top = Number.isFinite(x) && x === best[`${v1}.${v2}.${l}`];
+        return `<td class="${top ? 'top' : ''}">${Number.isFinite(x) ? `${x.toFixed(0)}${unit}` : '—'}</td>`;
+      }).join('')}</tr>`;
+    }).join('')}`).join('');
+  const mae = (k, f, l) => { const c = v.configs[k]; const s = c && get(c, l)[f]; return s && Number.isFinite(s.mae) ? s.mae : null; };
+  const n1n = mae('new', 'tmax', '1'), o1 = mae('old', 'tmax', '1');
+  box.innerHTML = `
+    <div class="acc-key">
+      <div><b>${n1(n1n, 2)} ℃</b><span>明天白天最高气温平均误差</span><em>原方案 ${n1(o1, 2)} ℃</em></div>
+      <div><b>${n1(mae('new', 'tmin', '1'), 2)} ℃</b><span>今夜最低气温平均误差</span><em>原方案 ${n1(mae('old', 'tmin', '1'), 2)} ℃</em></div>
+      <div><b>${n1(get(v.configs.new, '1').rain.pc)}%</b><span>明天晴雨准确率</span><em>原方案 ${n1(get(v.configs.old, '1').rain.pc)}%</em></div>
+    </div>
+    <div class="acc-wrap"><table class="acc-t">
+      <thead><tr><th scope="col">方案</th>${leads.map(l => `<th scope="col">第${l}天</th>`).join('')}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${v.pop ? `<p class="note">明细里的降水概率（8 家模式各自订正后的有雨比例）：Brier 技巧评分 ${n1(v.pop.bss * 100)}%（相对气候概率）；
+      ${v.pop.reliability.filter(r => r.n).map(r => `预报 ${Math.round(r.bin[0] * 100)}—${Math.round(r.bin[1] * 100)}% 时实况有雨 ${n1(r.observed * 100)}%`).join('，')}。</p>` : ''}
+    <p class="note">${esc(v.notes || '')} 每列最好的成绩加粗。</p>`;
 }
 function renderText() { $('doc-text').textContent = S.doc.text || ''; }
 
@@ -681,8 +768,11 @@ function renderRuns() {
   const sel = $('runs');
   if (!S.runs.length) { sel.hidden = true; return; }
   sel.hidden = false;
-  sel.innerHTML = S.runs.map(r =>
-    `<option value="${esc(r.file)}"${r.file === S.file ? ' selected' : ''}>${esc(r.run)} UTC 起报</option>`).join('');
+  sel.innerHTML = S.runs.map(r => {
+    const label = r.engine === 'multimodel' && r.issue_local
+      ? `${r.issue_local.slice(5, 16).replace('T', ' ')} 发布` : `${r.run} UTC 起报`;
+    return `<option value="${esc(r.file)}"${r.file === S.file ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
 }
 async function pickRun(file) {
   const sel = $('runs');
@@ -713,13 +803,16 @@ function paint() {
   renderWeek();
   renderTowns();
   renderMethod();
+  renderAccuracy();
   renderText();
   renderApi();
   renderRuns();
   const m = S.doc.meta;
   $('foot').innerHTML =
-    `<span>${esc(m.county)} · ${esc(m.run)} UTC 起报 · 生成于 ${esc(bjTime(m.generated))} 北京时</span>` +
-    `<span>数据：ECMWF 开放数据、NOAA GFS/GEFS、Copernicus DEM · 自动生成，仅供参考</span>`;
+    `<span>${esc(m.county)} · ${m.engine === 'multimodel' ? `${esc((m.sources || []).length)} 家模式融合` : `${esc(m.run)} UTC 起报`}` +
+    ` · 生成于 ${esc(bjTime(m.generated))} 北京时</span>` +
+    `<span>${m.engine === 'multimodel' ? '模式数据：<a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a>（CC BY 4.0）· ' : ''}` +
+    `ECMWF 开放数据、NOAA GFS/GEFS、Copernicus DEM、OGIMET · 自动生成，仅供参考</span>`;
 }
 
 function wire() {

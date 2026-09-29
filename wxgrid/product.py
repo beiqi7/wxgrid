@@ -42,10 +42,12 @@ from . import daily as daily_mod
 from . import downscale, phenomena, pipeline, probability
 from . import hourly as hourly_mod
 from . import periods as periods_mod
+from . import postproc
 from .points import Township
 from .sources import REGISTRY
 from .sources import gefs as gefs_mod
 from .sources import gfs as gfs_mod_det
+from .sources import openmeteo
 
 WEEKDAY = periods_mod.WEEKDAY
 #: Length of the public 3-hourly series. 0–72 h at 3 h is the CMA 城镇精细化
@@ -128,7 +130,7 @@ def _majority(values: list[str]) -> str:
 
 
 def _series3h(ds: xr.Dataset, *, issue_utc_h: float, tz: float, hours: int,
-              ens=None) -> dict[str, Any]:
+              ens=None, step_pop: np.ndarray | None = None) -> dict[str, Any]:
     """The public 3-hourly series: window ends after the issue time, for ``hours``."""
     steps = ds["step"].values.astype(int)
     gap = int(np.median(np.diff(steps))) if len(steps) > 1 else 3
@@ -138,7 +140,12 @@ def _series3h(ds: xr.Dataset, *, issue_utc_h: float, tz: float, hours: int,
     st = steps[keep]
     off = int(round(tz))
     times = [str(np.datetime64(init_h + int(s) + off, "h"))[:13] + ":00" for s in st]
-    pop = hourly_mod.hourly_pop(ens, np.datetime64(init_h, "h"), st) if ens is not None else None
+    if ens is not None:
+        pop = hourly_mod.hourly_pop(ens, np.datetime64(init_h, "h"), st)
+    elif step_pop is not None:
+        pop = np.asarray(step_pop, dtype=float)[:, keep]
+    else:
+        pop = None
 
     def col(var):
         return ds[var].transpose("point", "step").values[:, keep].astype(float) if var in ds else None
@@ -172,11 +179,23 @@ def _series3h(ds: xr.Dataset, *, issue_utc_h: float, tz: float, hours: int,
 def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, county: str, seat: str,
           run: str, member: str, sources: tuple[str, ...], weights: dict[str, float] | None,
           tz: float, ens=None, ens_run: str | None = None,
-          series_hours: int = SERIES_HOURS) -> dict[str, Any]:
-    """Assemble the JSON product from a (point, step) township dataset."""
+          series_hours: int = SERIES_HOURS, extremes: dict[str, np.ndarray] | None = None,
+          period_pop: np.ndarray | None = None, step_pop: np.ndarray | None = None,
+          pop_members: int | None = None) -> dict[str, Any]:
+    """Assemble the JSON product from a (point, step) township dataset.
+
+    ``extremes`` (``{"tmax"|"tmin": (point, period)}``) overrides the period
+    extremes aggregated from ``ds`` — the multi-model engine passes the mean of
+    each member's own extremes, which is what the verification scores.
+    """
     if not periods:
         raise ValueError("no forecast periods — the run does not reach the issue time")
     agg = periods_mod.aggregate(ds, periods)
+    if extremes:
+        for var in ("tmax", "tmin"):
+            v = np.asarray(extremes[var], dtype=float)
+            agg[var] = (("point", "period"), np.where(np.isfinite(v), v, agg[var].values))
+        agg["tmax"] = (("point", "period"), np.fmax(agg["tmax"].values, agg["tmin"].values))
     names = [str(n) for n in ds["name"].values]
     ids = [str(p) for p in ds["point"].values]
     steps = ds["step"].values.astype(int)
@@ -192,6 +211,8 @@ def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, count
         s_utc = np.array([init_h + p.start_lead for p in periods])
         pop = probability.window_pop(ens, s_utc, s_utc + periods_mod.PERIOD_H)
         pop_ids = list(ens.point_ids)
+    elif period_pop is not None:
+        pop, pop_ids = np.asarray(period_pop, dtype=float), ids
 
     out_periods: list[dict[str, Any]] = []
     for k, p in enumerate(periods):
@@ -239,13 +260,14 @@ def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, count
             "source_label": str(ds.attrs.get("source", member)),
             "tz": tz, "n_periods": len(out_periods), "n_townships": len(ids),
             "series_hours": series_hours,
-            "pop_members": len(ens.members) if ens is not None else 0,
+            "pop_members": len(ens.members) if ens is not None else (pop_members or 0),
+            "pop_source": "gefs" if ens is not None else ("multimodel" if period_pop is not None else None),
             "pop_run": ens_run,
             "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         },
         "periods": out_periods,
         "days": days,
-        "series3h": _series3h(ds, issue_utc_h=issue_h, tz=tz, hours=series_hours, ens=ens),
+        "series3h": _series3h(ds, issue_utc_h=issue_h, tz=tz, hours=series_hours, ens=ens, step_pop=step_pop),
         "townships": roster,
     }
     doc["conclusions"] = conclusions(doc, ds, seat_id=seat_id, tz=tz)
@@ -449,18 +471,123 @@ def choose_run(sources: tuple[str, ...], issue_utc, *, n_days: int, tz: float, s
     raise RuntimeError(f"no recent cycle of {sources} reaches the forecast periods")
 
 
+ENGINES = ("multimodel", "grib")
+
+
+def virtual_init(issue_utc) -> dt.datetime:
+    """Step origin for the multi-model engine: the issue time floored to 3 h (UTC).
+
+    Its members come from different cycles; what matters is that the 3-hourly
+    windows line up with 08/20 BJT, i.e. with 00/12 UTC.
+    """
+    t = issue_utc if isinstance(issue_utc, dt.datetime) else dt.datetime.fromisoformat(str(issue_utc))
+    t = t.replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    return t - dt.timedelta(hours=t.hour % 3)
+
+
+def _gefs(points, init_utc: dt.datetime, end_lead: int, *, sess, workers, min_age_hours=None):
+    """``(EnsemblePrecip, run)`` from the newest GEFS cycle reaching ``end_lead`` after ``init_utc``, else (None, None)."""
+    kw = {"min_age_hours": min_age_hours} if min_age_hours else {}
+    for c in gefs_mod.candidate_runs(**kw):
+        need = end_lead + int((init_utc - c.init_time.replace(tzinfo=None)).total_seconds() // 3600)
+        need += (-need) % 6
+        if need > 0 and gefs_mod.probe_run(sess, c, need):
+            return gefs_mod.fetch_ensemble(points, c, list(range(6, need + 1, 6)), sess=sess,
+                                           max_workers=workers), c
+    return None, None
+
+
+def compute_multimodel(points: list[Township], *, county: str, seat: str, days: int = 5,
+                       tz: float = daily_mod.TZ_CHINA, want_pop: bool = True, workers: int = 4,
+                       issue_utc=None, sess=None, hourly: bool = False, calibrate: bool = True,
+                       verify_root=None, min_age_hours: float | None = None
+                       ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Eight global models via Open-Meteo, averaged, then station-corrected.
+
+    See :mod:`wxgrid.sources.openmeteo` for the members and :mod:`wxgrid.postproc`
+    for the corrections; both were chosen by verification against the national
+    stations around the county.
+    """
+    sess = sess or pipeline.session()
+    issue_utc = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    init = virtual_init(issue_utc)
+    plan = periods_mod.plan(init, issue_utc, tz=tz, n_days=days)
+    steps = periods_mod.steps_for(plan)
+    raw = openmeteo.fetch(points, days=7, past_days=1, sess=sess)
+    members = openmeteo.member_datasets(raw, points, init, steps)
+    mean = openmeteo.ensemble(raw, points, init, steps, members=members)
+    cal = postproc.refresh(verify_root or postproc.DEFAULT_ROOT, sess=sess) if calibrate else None
+    corrected, factors = postproc.apply(mean, plan, cal, issue_utc=issue_utc, tz=tz)
+    ext = postproc.apply_extremes(openmeteo.period_extremes(members, plan), plan, cal,
+                                  init_utc=init, issue_utc=issue_utc)
+
+    # Detail probabilities: share of members wet after each member's own quantile map
+    # (Brier skill ~0.5 against climatology at the stations); GEFS only without them.
+    pp, sp = postproc.member_period_pop(members, plan, cal) if want_pop else (None, None)
+    ens = ens_run = None
+    if want_pop and pp is None:
+        try:
+            ens, ens_run = _gefs(points, init, plan[-1].end_lead, sess=sess, workers=workers,
+                                 min_age_hours=min_age_hours)
+        except Exception:  # noqa: BLE001 — probabilities are detail only
+            ens = ens_run = None
+    run = init.strftime("%Y%m%d%H")
+    prod = build(corrected, periods=plan, issue_utc=issue_utc, county=county, seat=seat, run=run,
+                 member="multimodel", sources=tuple(raw["members"]), weights=None, tz=tz, ens=ens,
+                 ens_run=str(ens_run) if ens_run else None, extremes=ext,
+                 period_pop=pp, step_pop=sp, pop_members=len(members))
+    prod["meta"]["engine"] = "multimodel"
+    prod["meta"]["member_names"] = [openmeteo.MEMBERS.get(m, m) for m in raw["members"]]
+    prod["meta"]["calibration"] = None if not cal else {
+        k: cal.get(k) for k in ("method", "window", "alpha", "n_pairs", "generated")}
+    prod["meta"]["attribution"] = "Weather data by Open-Meteo.com (CC BY 4.0)"
+    prod["verification"] = postproc.load_scores(verify_root or postproc.DEFAULT_ROOT)
+    if not hourly:
+        return prod, None
+    hr = openmeteo.hourly_dataset(raw, points, init, range(1, plan[-1].end_lead + 1))
+    hr = postproc.apply_hourly(hr, plan, cal, factors, issue_utc=issue_utc, tz=tz)
+    hpop = None
+    if ens is not None:
+        hpop = hourly_mod.hourly_pop(ens, np.datetime64(init, "h"), hr["step"].values)
+    elif sp is not None:  # each hour takes the probability of the 3-hour window it falls in
+        col = {int(s): j for j, s in enumerate(steps)}
+        idx = [col.get(int(-(-h // 3) * 3)) for h in hr["step"].values]
+        hpop = np.stack([sp[:, j] if j is not None else np.full(sp.shape[0], np.nan) for j in idx], axis=1)
+    hdoc = hourly_mod.build(hr, county=county, seat=seat, run=run, tz=tz, pop=hpop,
+                            pop_members=len(ens.members) if ens is not None else len(members),
+                            pop_run=str(ens_run) if ens is not None else None)
+    return prod, hdoc
+
+
 def compute_bundle(points: list[Township], *, county: str, seat: str, days: int = 5, every: int = 3,
                    sources: tuple[str, ...] = ("ecmwf", "gfs"), member: str = "blend",
                    weights: dict[str, float] | None = None, tz: float = daily_mod.TZ_CHINA,
                    pad: float = 0.75, want_pop: bool = True, workers: int = 4,
                    min_age_hours: float | None = None, run=None, issue_utc=None, sess=None,
-                   hourly: bool = False) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """``(product, hourly)`` for one cycle; ``hourly`` is None unless requested.
+                   hourly: bool = False, engine: str = "multimodel", calibrate: bool = True,
+                   verify_root=None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``(product, hourly)``; ``hourly`` is None unless requested.
 
-    ``issue_utc`` (naive UTC, default now) decides the first period.
+    ``engine="multimodel"`` (default) uses eight models via Open-Meteo with
+    station calibration and falls back to ``"grib"`` — ECMWF IFS + GFS from their
+    open GRIB archives, downscaled here — when Open-Meteo cannot be reached.
+    ``run`` pins a GRIB cycle and implies the GRIB engine. ``issue_utc`` (naive
+    UTC, default now) decides the first period.
     """
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {ENGINES}")
     sess = sess or pipeline.session()
     issue_utc = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    if engine == "multimodel" and run is None:
+        try:
+            return compute_multimodel(points, county=county, seat=seat, days=days, tz=tz, want_pop=want_pop,
+                                      workers=workers, issue_utc=issue_utc, sess=sess, hourly=hourly,
+                                      calibrate=calibrate, verify_root=verify_root,
+                                      min_age_hours=min_age_hours)
+        except Exception as exc:  # noqa: BLE001 — never go without a forecast
+            import sys
+            print(f"[product] multimodel engine failed ({type(exc).__name__}: {exc}); "
+                  "falling back to ECMWF+GFS GRIB", file=sys.stderr, flush=True)
     if run is None:
         run, plan = choose_run(sources, issue_utc, n_days=days, tz=tz, sess=sess, min_age_hours=min_age_hours)
     else:
@@ -475,21 +602,14 @@ def compute_bundle(points: list[Township], *, county: str, seat: str, days: int 
 
     ens = ens_run = None
     if want_pop:
-        ens_steps = list(range(6, plan[-1].end_lead + 1, 6))
-        kw = {"min_age_hours": min_age_hours} if min_age_hours else {}
-        # the ensemble may be a newer cycle; it needs to reach the same valid time
-        for c in gefs_mod.candidate_runs(**kw):
-            need = plan[-1].end_lead + int((run.init_time - c.init_time).total_seconds() // 3600)
-            if need > 0 and gefs_mod.probe_run(sess, c, need + (-need) % 6):
-                ens_run = c
-                ens_steps = list(range(6, need + (-need) % 6 + 1, 6))
-                break
-        if ens_run is not None:
-            ens = gefs_mod.fetch_ensemble(points, ens_run, ens_steps, sess=sess, max_workers=workers)
+        ens, ens_run = _gefs(points, run.init_time.replace(tzinfo=None), plan[-1].end_lead, sess=sess,
+                             workers=workers, min_age_hours=min_age_hours)
 
     prod = build(chosen, periods=plan, issue_utc=issue_utc, county=county, seat=seat, run=str(run),
                  member=member, sources=sources, weights=weights, tz=tz, ens=ens,
                  ens_run=str(ens_run) if ens_run else None)
+    prod["meta"]["engine"] = "grib"
+    prod["meta"]["calibration"] = None
     if not hourly:
         return prod, None
 

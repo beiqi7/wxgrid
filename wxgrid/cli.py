@@ -106,7 +106,7 @@ def cmd_bulletin(args) -> int:
     doc = product.compute(pts, county=args.county, seat=args.seat, days=args.days, every=args.every,
                           sources=sources, member=args.member, weights=_parse_weights(args.weights),
                           tz=args.tz, pad=args.pad, want_pop=not args.no_pop, workers=args.workers,
-                          min_age_hours=args.min_age_hours, run=run)
+                          min_age_hours=args.min_age_hours, run=run, engine=args.engine)
     print(doc["text"])
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
@@ -174,6 +174,30 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_verify(args) -> int:
+    """Refresh the station archive, refit the calibration, print the scores."""
+    import json
+
+    from . import postproc
+    cal = postproc.refresh(args.dir, max_age_days=0 if args.force else 1)
+    scores = postproc.load_scores(args.dir)
+    if not cal or not scores or scores.get("error"):
+        print("no calibration yet:", (scores or {}).get("error", "archive empty"))
+        return 1
+    print(f"calibration {cal['window'][0]} .. {cal['window'][1]}, {cal['n_pairs']} pairs, alpha {cal['alpha']}")
+    print(f"scores {scores['window'][0]} .. {scores['window'][1]} ({scores['days']} days, stations {', '.join(scores['stations'])})")
+    print(f"{'':30s} " + "  ".join(f"{'第' + str(l) + '天':^27s}" for l in (1, 3, 5)))
+    for key, c in scores["configs"].items():
+        cells = []
+        for lead in ("1", "3", "5"):
+            s = c["scores"].get(lead) or c["scores"].get(int(lead))
+            cells.append(f"Tx {s['tmax']['mae']:4.2f}/{s['tmax']['acc2']:3.0f}% Tn {s['tmin']['mae']:4.2f} 晴雨{s['rain']['pc']:3.0f}%")
+        print(f"{c['label'][:28]:30s} " + "  ".join(cells))
+    if args.json:
+        print(json.dumps(scores, ensure_ascii=False, indent=1, default=float))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wxgrid", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -223,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--run", default=None)
     b.add_argument("--min-age-hours", type=float, default=None,
                    help="ignore cycles younger than this (default 2, i.e. use the settled cycle)")
+    b.add_argument("--engine", choices=("multimodel", "grib"), default="multimodel")
     b.add_argument("--out", default=None, help="also write the product JSON here")
     b.set_defaults(func=cmd_bulletin)
 
@@ -248,6 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--min-obs", type=int, default=20)
     c.add_argument("--out", required=True)
     c.set_defaults(func=cmd_calibrate)
+
+    v = sub.add_parser("verify", help="update station observations, refit calibration, print skill scores")
+    v.add_argument("--dir", default="/var/lib/wxgrid/verify")
+    v.add_argument("--force", action="store_true", help="refit even if the calibration is less than a day old")
+    v.add_argument("--json", action="store_true")
+    v.set_defaults(func=cmd_verify)
 
     pub = sub.add_parser("publish", add_help=False,
                          help="compute a product and store it under --data-dir (see `publish --help`)")

@@ -353,8 +353,30 @@ def pub(tmp_path, monkeypatch):
 
     monkeypatch.setattr(product, "compute_bundle", fake_bundle)
     monkeypatch.setattr(publish, "session", lambda: object())
-    kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "data"))
+    kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "data"), engine="grib")
     return tmp_path / "data", kw, calls, first
+
+
+def test_publish_multimodel_skips_the_same_issue_window(tmp_path, monkeypatch):
+    csv = tmp_path / "t.csv"
+    csv.write_text("id,name,lat,lon,elevation_m\nA,甲镇,28.3,117.7,60\n", encoding="utf-8")
+    calls = []
+    issue = dt.datetime(2026, 9, 28, 11, 30)
+
+    def fake_bundle(pts, **kw):
+        calls.append(kw)
+        meta = {"county": "测试县", "run": "2026092809", "generated": "2026-09-28T11:31:00+00:00",
+                "schema": product.SCHEMA}
+        return {"meta": meta, "periods": [{"start_local": "2026-09-28T20:00"}]}, {"meta": meta, "points": {}}
+
+    monkeypatch.setattr(product, "compute_bundle", fake_bundle)
+    monkeypatch.setattr(publish, "session", lambda: object())
+    kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "d"), issue_utc=issue)
+    out = publish.publish_once(**kw)
+    assert out.name == "测试县_2026092809.json" and calls[0]["engine"] == "multimodel"
+    assert str(calls[0]["verify_root"]).endswith("/d/verify")
+    publish.publish_once(**kw)
+    assert len(calls) == 1
 
 
 def test_publish_skips_a_cycle_already_on_disk_without_computing(pub):
