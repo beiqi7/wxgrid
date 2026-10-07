@@ -205,7 +205,7 @@ function popNote(threeHourly) {
   if (m.pop_source === 'native') {
     return threeHourly
       ? `降水概率为 NOAA GEFS ${m.pop_members || 21} 个成员中所在 6 小时有 ≥0.1 mm 降水的比例，仅作明细参考。`
-      : `降水概率由 NOAA GEFS ${m.pop_members || 21} 个成员的有雨比例与 3 家模式雨量经逻辑回归校准（按周边国家站实况拟合），仅作明细参考。`;
+      : `降水概率由 3 家模式的雨量经逻辑回归校准（按周边国家站实况拟合），仅作明细参考。`;
   }
   if (m.pop_source === 'multimodel') {
     return `降水概率为 ${m.pop_members || 8} 家模式中（各自订正后）${threeHourly ? '该 3 小时' : '该时段'}有 ≥0.1 mm 降水的比例，仅作明细参考。`;

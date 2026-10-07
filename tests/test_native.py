@@ -235,7 +235,21 @@ def test_ecmwf_catalogue_with_fallback_names(monkeypatch):
     jobs = raw._ecmwf_jobs(raw.IFS, dt.datetime(2025, 6, 1, 12), 96, ("t2m", "gust", "tp", "tcc"), None)
     got = {j[0]: j[3] for j in jobs}
     assert got == {"t2m": 0, "gust": 20, "tp": 30}      # 10fg3 stands in for 10fg; no tcc that day
-    assert jobs[0][2].endswith("/20250601/12z/ifs/0p25/oper/20250601120000-96h-oper-fc.grib2")
+    assert jobs[0][2] == "20250601/12z/ifs/0p25/oper/20250601120000-96h-oper-fc.grib2"
+
+
+def test_ecmwf_falls_back_to_the_next_mirror(monkeypatch):
+    seen = []
+
+    def fake_get(sess, url, **kw):
+        seen.append(url)
+        if url.startswith("https://mirror-a"):
+            raise RuntimeError("503 SlowDown")
+        return b"ok"
+    monkeypatch.setattr(raw, "ECMWF_BASES", ("https://mirror-a", "https://mirror-b"))
+    monkeypatch.setattr(raw, "get", fake_get)
+    assert raw._ecmwf_get(None, "x/y.index") == b"ok"
+    assert seen == ["https://mirror-a/x/y.index", "https://mirror-b/x/y.index"]
 
 
 def test_model_steps():

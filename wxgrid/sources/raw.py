@@ -33,7 +33,10 @@ from .. import gribbox
 from ..gribbox import Box, BoxRun
 from ._fetch import get, head_ok, session
 
-ECMWF_BASE = os.environ.get("WXGRID_ECMWF_BASE", "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com")
+#: ECMWF open data mirrors, tried in order: the AWS copy, then ECMWF's own server.
+#: ``WXGRID_ECMWF_BASE`` pins a single one.
+ECMWF_BASES = ((os.environ["WXGRID_ECMWF_BASE"],) if os.environ.get("WXGRID_ECMWF_BASE") else
+               ("https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com", "https://data.ecmwf.int/forecasts"))
 GFS_BASE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
 
 
@@ -93,8 +96,20 @@ VERIFY_FIELDS = ("t2m", "tmax", "tmin", "u10", "v10", "tp")
 # ------------------------------------------------------------------ locations
 
 def _ecmwf_dir(model: Model, init: dt.datetime) -> str:
+    """Path of a cycle's files relative to a mirror base."""
     product = {"ifs": "ifs", "aifs": "aifs-single"}[model.key]
-    return f"{ECMWF_BASE}/{init:%Y%m%d}/{init:%H}z/{product}/0p25/oper"
+    return f"{init:%Y%m%d}/{init:%H}z/{product}/0p25/oper"
+
+
+def _ecmwf_get(sess, rel: str, *, byte_range=None) -> bytes:
+    """GET from the first mirror that answers (the AWS copy throttles with 503 SlowDown under load)."""
+    last: Exception | None = None
+    for base in ECMWF_BASES:
+        try:
+            return get(sess, f"{base}/{rel}", byte_range=byte_range, timeout=90, retries=6)
+        except Exception as exc:  # noqa: BLE001 — try the next mirror
+            last = exc
+    raise RuntimeError(f"no ECMWF mirror served {rel}") from last
 
 
 def _ecmwf_stem(init: dt.datetime, step: int) -> str:
@@ -110,7 +125,8 @@ def probe(model: Model, init: dt.datetime, step: int, sess=None) -> bool:
     sess = sess or session()
     if model.key == "gfs":
         return head_ok(sess, _gfs_url(init, step) + ".idx")
-    return head_ok(sess, f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, step)}.index")
+    rel = f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, step)}.index"
+    return any(head_ok(sess, f"{base}/{rel}") for base in ECMWF_BASES)
 
 
 # ------------------------------------------------------------------ message catalogue
@@ -121,7 +137,7 @@ _WINDOW = re.compile(r"(\d+)-(\d+) (hour|day) (acc|max|min|ave)")
 def _ecmwf_jobs(model: Model, init, step, fields, sess) -> list[tuple]:
     """``[(field, step, url, offset, length, window_start), ...]`` for one lead time."""
     base = f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, step)}"
-    rows = [json.loads(line) for line in get(sess, base + ".index", timeout=60).decode("utf-8").splitlines() if line.strip()]
+    rows = [json.loads(line) for line in _ecmwf_get(sess, base + ".index").decode("utf-8").splitlines() if line.strip()]
     sfc = {}
     for r in rows:
         if r.get("levtype") == "sfc":
@@ -180,7 +196,7 @@ def _orog_job(model: Model, init, sess, first_step: int) -> tuple | None:
                 return ("orog", 0, url, off, rows[k + 1][0] - off, None)
         return None
     base = f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, 0)}"
-    for line in get(sess, base + ".index", timeout=60).decode("utf-8").splitlines():
+    for line in _ecmwf_get(sess, base + ".index").decode("utf-8").splitlines():
         r = json.loads(line)
         if r.get("levtype") == "sfc" and r["param"] == "z":
             return ("orog", 0, base + ".grib2", int(r["_offset"]), int(r["_length"]), None)
@@ -214,7 +230,10 @@ def fetch(model: Model | str, init: dt.datetime, steps, box: Box, *, fields=None
 
         def one(job):
             f, step, url, off, length, win = job
-            blob = get(sess, url, byte_range=(off, off + length - 1), timeout=90)
+            if model.key == "gfs":
+                blob = get(sess, url, byte_range=(off, off + length - 1), timeout=90)
+            else:  # ECMWF jobs carry a mirror-relative path
+                blob = _ecmwf_get(sess, url, byte_range=(off, off + length - 1))
             vals, lat, lon, keys = gribbox.decode_box(gribbox.split_messages(blob)[0], box)
             return f, step, gribbox._to_canonical(vals, keys.get("units", ""), f), lat, lon, win
 

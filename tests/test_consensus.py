@@ -94,7 +94,9 @@ def test_pop_is_calibrated_and_falls_back_to_gefs():
     o = (tab["o_p"] >= 0.1).astype(float)
     assert ((pred["pop"] - o) ** 2).mean() < ((tab["gefs_pop"] - o) ** 2).mean()
     share = np.array([0.3, 0.9])
-    np.testing.assert_allclose(consensus.predict_pop(None, "day", share, {}), share)
+    totals = {"ifs": np.array([0.0, 2.0]), "aifs": np.array([0.0, 0.0]), "gfs": np.array([0.5, 3.0])}
+    np.testing.assert_allclose(consensus.predict_pop(None, "day", totals, share), share)      # GEFS fallback
+    np.testing.assert_allclose(consensus.predict_pop(None, "day", totals), [1 / 3, 2 / 3])    # member share
 
 
 def test_backtest_is_out_of_sample_and_beats_the_raw_mean():

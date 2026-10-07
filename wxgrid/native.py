@@ -441,11 +441,19 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
         precip[:, sel] *= fac[:, None]
         snow[:, sel] *= fac[:, None]
     out["precip"], out["snow"] = precip, np.minimum(snow, precip)
+    # speed: mean of the members' speeds (averaging vectors shrinks it where they disagree),
+    # scaled per window kind by the fitted ratio; direction: the mean vector
     u, v = mean_of("u10"), mean_of("v10")
+    with np.errstate(invalid="ignore"):
+        speeds = np.nanmean(np.stack([np.hypot(ds["u10"].values, ds["v10"].values) for ds in mds.values()]), axis=0)
+    k_wind = np.array([consensus.wind_factor(cal, kind) for kind, _, _ in keys])[None, :]
+    speed = speeds * k_wind
+    vec = np.hypot(u, v)
+    unit = np.where(vec > 1e-6, 1.0 / np.where(vec > 1e-6, vec, 1.0), 0.0)
+    u, v = u * unit * speed, v * unit * speed
     out["u10"], out["v10"] = u, v
-    speed = np.hypot(u, v)
     gust = mean_of("gust")
-    out["gust"] = np.fmax(gust, speed) if gust is not None else speed
+    out["gust"] = np.fmax(gust, speed) if gust is not None else speed   # gusts unverified: not scaled
     cloud = mean_of("cloud")
     out["cloud"] = cloud if cloud is not None else np.where(precip >= 0.1, 0.9, 0.3)
     out["wind_speed"] = speed
@@ -472,9 +480,10 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
         t = consensus.combine_temperature(temp_cal, p.kind, lead_day(end, issue_nominal), per)
         ext["tmax" if p.kind == "day" else "tmin"][:, k] = t
 
-    # ---- probabilities (detail only)
+    # ---- probabilities (detail only): per period from the members, calibrated; per 3 h from GEFS
     pp = sp = None
     n_ens = 0
+    gefs_share = None
     if ens_run is not None:
         names_m = sorted(f for f in ens_run.fields if f.startswith("tp_"))
         lat = np.array([q.lat for q in pts])
@@ -489,17 +498,22 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
                                           members=tuple(np.array(names_m)[good]),
                                           init_time=np.datetime64(cycle, "s"), point_ids=tuple(q.id for q in pts))
             sp = hourly_mod.hourly_pop(ens, np.datetime64(init_v, "s"), steps_v)
-            pp = np.full((len(pts), len(plan)), np.nan)
+            gefs_share = np.full((len(pts), len(plan)), np.nan)
             for k, p in enumerate(plan):
                 start, end = _period_bounds(p, init_v)
                 s0, s1 = (start - cycle).total_seconds() / 3600, (end - cycle).total_seconds() / 3600
                 j0, j1 = np.nonzero(ens_run.steps == s0)[0], np.nonzero(ens_run.steps == s1)[0]
-                if not j1.size or (s0 > 0 and not j0.size):
-                    continue
-                amt = accm[:, :, j1[0]] - (accm[:, :, j0[0]] if s0 > 0 else 0.0)
-                share = (amt >= consensus.WET_MM).mean(axis=0)
-                pp[:, k] = 100.0 * consensus.predict_pop((cal or {}).get("pop"), p.kind, share,
-                                                         {m: member_tot[m][:, k] for m in runs})
+                if j1.size and (s0 == 0 or j0.size):
+                    amt = accm[:, :, j1[0]] - (accm[:, :, j0[0]] if s0 > 0 else 0.0)
+                    gefs_share[:, k] = (amt >= consensus.WET_MM).mean(axis=0)
+    if want_pop:
+        pp = np.full((len(pts), len(plan)), np.nan)
+        for k, p in enumerate(plan):
+            pp[:, k] = 100.0 * consensus.predict_pop(
+                (cal or {}).get("pop"), p.kind, {m: member_tot[m][:, k] for m in runs},
+                None if gefs_share is None else gefs_share[:, k])
+        if not np.isfinite(pp).any():
+            pp = None
 
     prod = product.build(ds, periods=plan, issue_utc=issue, county=county, seat=seat,
                          run=init_v.strftime("%Y%m%d%H"), member="native", sources=tuple(runs), weights=None,
@@ -509,7 +523,7 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
     meta["cycle"] = cycle.strftime("%Y%m%d%H")
     meta["member_names"] = [raw.MODELS[m].label for m in runs]
     meta["pop_source"] = "native" if pp is not None else None
-    meta["pop_run"] = cycle.strftime("%Y%m%d%H") if pp is not None else None
+    meta["pop_run"] = cycle.strftime("%Y%m%d%H") if sp is not None else None
     meta["calibration"] = None if not cal else {
         k: cal.get(k) for k in ("method", "window", "n_pairs", "generated", "lapse")}
     if cal:

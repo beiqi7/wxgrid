@@ -16,8 +16,12 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
   inversions (:func:`wxgrid.native.point_values`).
 * **Precipitation** — 12 h totals of the member mean, quantile-mapped from the
   forecast to the observed climatology of the window.
-* **Probability** — logistic regression of "≥0.1 mm observed" on the GEFS
-  share of wet members and the deterministic members (detail only).
+* **Wind** — speed is the mean of the members' speeds times a ratio of
+  means per period kind (the models run ~20 % light against these
+  stations); direction from the averaged vector.
+* **Probability** — logistic regression of "≥0.1 mm observed" on the
+  members' quantile-mapped amounts (detail only); GEFS gives the 3-hourly
+  detail.
 
 Everything scored here is out of sample: :func:`backtest` refits for every
 forecast day on periods that ended before it was issued.
@@ -196,6 +200,30 @@ def map_precip(cal_p: dict | None, kind: str, total) -> np.ndarray:
     return qmap(total, (cal_p or {}).get(kind))
 
 
+# ------------------------------------------------------------------ wind
+
+WIND_RATIO = (0.6, 1.8)
+
+
+def member_mean_wind(tab: pd.DataFrame, members=MEMBERS) -> pd.Series:
+    return tab[[f"{m}_w" for m in members]].mean(axis=1, skipna=False)
+
+
+def fit_wind(tab: pd.DataFrame, *, members=MEMBERS) -> dict:
+    """Ratio of observed to member-mean wind per kind (pooled leads), clipped to :data:`WIND_RATIO`."""
+    out = {}
+    f = member_mean_wind(tab, members)
+    for kind in ("day", "night"):
+        s = (tab["kind"] == kind) & f.notna() & tab["o_w"].notna()
+        if s.sum() >= 100 and f[s].mean() > 0.3:
+            out[kind] = round(float(np.clip(tab.loc[s, "o_w"].mean() / f[s].mean(), *WIND_RATIO)), 3)
+    return out
+
+
+def wind_factor(cal: dict | None, kind: str) -> float:
+    return float(((cal or {}).get("wind") or {}).get(kind, 1.0))
+
+
 # ------------------------------------------------------------------ probability
 
 def _logit_fit(X: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 50) -> np.ndarray:
@@ -213,39 +241,49 @@ def _logit_fit(X: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 50) -
     return w
 
 
-def pop_features(gefs_share, member_totals: dict[str, np.ndarray], cal_pm: dict | None, kind: str) -> np.ndarray:
-    """[GEFS share wet, share of members wet after their own quantile map, log1p of their mapped mean]."""
+def pop_features(member_totals: dict[str, np.ndarray], cal_pm: dict | None, kind: str) -> np.ndarray:
+    """[share of members wet after their own quantile map, log1p of their mapped mean amount]."""
     fits = (cal_pm or {}).get(kind) or {}
-    mapped = np.stack([qmap(np.asarray(v, dtype=float), fits.get(m)) for m, v in member_totals.items()])
+    mapped = np.stack([qmap(np.asarray(v, dtype=float).ravel(), fits.get(m)) for m, v in member_totals.items()])
     with np.errstate(invalid="ignore"):
         wet = np.nanmean(np.where(np.isfinite(mapped), mapped >= WET_MM, np.nan), axis=0)
         lm = np.log1p(np.nanmean(mapped, axis=0))
-    return np.column_stack([np.asarray(gefs_share, dtype=float).ravel(), wet.ravel(), lm.ravel()])
+    return np.column_stack([wet, lm])
 
 
 def fit_pop(tab: pd.DataFrame, *, members=MEMBERS) -> dict:
-    """Per kind: member quantile maps and logistic coefficients."""
+    """Per kind: each member's quantile map and logistic coefficients on :func:`pop_features`.
+
+    The GEFS share was tried as a third predictor and added nothing (Brier skill
+    0.69 vs 0.70 at day 1 in the 2025 backtest), so the period probability does
+    not depend on the ensemble being available.
+    """
     out: dict[str, Any] = {"member_qmap": {}, "logit": {}}
     for kind in ("day", "night"):
-        g = tab[tab["kind"] == kind].dropna(subset=["o_p", "gefs_pop", *[f"{m}_p" for m in members]])
+        g = tab[tab["kind"] == kind].dropna(subset=["o_p", *[f"{m}_p" for m in members]])
         out["member_qmap"][kind] = {m: qmap_fit(g[f"{m}_p"], g["o_p"]) for m in members}
         if len(g) < 80:
             continue
-        X = pop_features(g["gefs_pop"].values, {m: g[f"{m}_p"].values for m in members},
-                         out["member_qmap"], kind)
+        X = pop_features({m: g[f"{m}_p"].values for m in members}, out["member_qmap"], kind)
         out["logit"][kind] = [round(float(x), 5) for x in _logit_fit(X, (g["o_p"].values >= WET_MM).astype(float))]
     return out
 
 
-def predict_pop(cal_pop: dict | None, kind: str, gefs_share, member_totals: dict[str, np.ndarray]) -> np.ndarray:
-    """Probability (0–1) of ≥0.1 mm in the period; the raw GEFS share without a fit."""
-    share = np.asarray(gefs_share, dtype=float)
+def predict_pop(cal_pop: dict | None, kind: str, member_totals: dict[str, np.ndarray], fallback=None) -> np.ndarray:
+    """Probability (0–1) of ≥0.1 mm in the period.
+
+    Without a fit: ``fallback`` (e.g. the GEFS share) if given, else the share of
+    members with ≥0.1 mm.
+    """
+    shape = np.shape(next(iter(member_totals.values())))
     coef = ((cal_pop or {}).get("logit") or {}).get(kind)
+    X = pop_features(member_totals, (cal_pop or {}).get("member_qmap"), kind)
     if not coef:
-        return share
-    X = pop_features(share, member_totals, (cal_pop or {}).get("member_qmap"), kind)
+        if fallback is not None:
+            return np.asarray(fallback, dtype=float).reshape(shape)
+        return X[:, 0].reshape(shape)
     p = 1.0 / (1.0 + np.exp(-np.clip(np.column_stack([np.ones(len(X)), X]) @ np.asarray(coef), -30, 30)))
-    return np.where(np.isfinite(X).all(axis=1), p, share.ravel()).reshape(share.shape)
+    return np.where(np.isfinite(X).all(axis=1), p, np.nan).reshape(shape)
 
 
 # ------------------------------------------------------------------ fit / apply
@@ -262,18 +300,20 @@ def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int =
         "n_pairs": int(tr["o_t"].notna().sum()) if len(tr) else 0,
         "lapse": {"day": "std", "night": "local"},
         "temp": fit_temperature(tr), "precip": fit_precip(tr) if len(tr) else {}, "pop": fit_pop(tr) if len(tr) else {},
+        "wind": fit_wind(tr) if len(tr) else {},
     }
 
 
 def predict(cal: dict | None, tab: pd.DataFrame) -> pd.DataFrame:
     """Consensus ``t``, ``p`` and ``pop`` for every row of a member table."""
-    out = pd.DataFrame(index=tab.index, columns=["t", "p", "pop"], dtype=float)
+    out = pd.DataFrame(index=tab.index, columns=["t", "p", "pop", "w"], dtype=float)
     for (kind, lead), g in tab.groupby(["kind", "lead"]):
+        out.loc[g.index, "w"] = member_mean_wind(g).values * wind_factor(cal, kind)
         vals = {m: g[f"{m}_t"].values for m in MEMBERS}
         out.loc[g.index, "t"] = combine_temperature((cal or {}).get("temp"), kind, int(lead), vals)
         out.loc[g.index, "p"] = map_precip((cal or {}).get("precip"), kind, member_mean_precip(g).values)
-        out.loc[g.index, "pop"] = predict_pop((cal or {}).get("pop"), kind, g["gefs_pop"].values,
-                                              {m: g[f"{m}_p"].values for m in MEMBERS})
+        out.loc[g.index, "pop"] = predict_pop((cal or {}).get("pop"), kind,
+                                              {m: g[f"{m}_p"].values for m in MEMBERS}, g["gefs_pop"].values)
     return out
 
 
@@ -290,7 +330,15 @@ def _ewma_bias(tr: pd.DataFrame, col: str, alpha: float = 0.1) -> dict:
     return out
 
 
-def _scores(f_t, f_p, rows: pd.DataFrame) -> dict[int, dict]:
+def _wind(f, o) -> dict:
+    from .phenomena import beaufort
+    sc = verify.wind_scores(f, o)
+    if f.size:
+        sc["force_exact"] = float(np.mean([beaufort(a) == beaufort(b) for a, b in zip(f, o)]) * 100)
+    return sc
+
+
+def _scores(f_t, f_p, rows: pd.DataFrame, f_w=None) -> dict[int, dict]:
     out = {}
     for lead in verify.LEADS:
         s = (rows["lead"] == lead).values
@@ -305,6 +353,8 @@ def _scores(f_t, f_p, rows: pd.DataFrame) -> dict[int, dict]:
                      "tmin": verify.temp_scores(*pair(f_t, o_t, ngt)),
                      "rain": verify.rain_scores(fp, op),
                      "rain5": verify.rain_scores(fp, op, f_thr=verify.MODERATE_12H_MM, o_thr=verify.MODERATE_12H_MM)}
+        if f_w is not None:
+            out[lead]["wind"] = _wind(*pair(np.asarray(f_w, dtype=float), rows["o_w"].values.astype(float), s))
     return out
 
 
@@ -334,8 +384,8 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
         tr_mean = tr.assign(mean=tr[[f"{m}_t_std" for m in MEMBERS]].mean(axis=1, skipna=False))
         b = _ewma_bias(tr_mean, "mean")
         mean_bias = mean_raw - np.array([b.get((k, int(ld)), 0.0) for k, ld in zip(test["kind"], test["lead"])])
-        preds.append(pd.DataFrame({"new_t": p["t"], "new_p": p["p"], "pop": p["pop"],
-                                   "raw_t": mean_raw, "mb_t": mean_bias,
+        preds.append(pd.DataFrame({"new_t": p["t"], "new_p": p["p"], "pop": p["pop"], "new_w": p["w"],
+                                   "raw_t": mean_raw, "mb_t": mean_bias, "raw_w": member_mean_wind(test),
                                    "raw_p": member_mean_precip(test)}, index=test.index))
     P = pd.concat(preds)
     rows = tab.loc[P.index]
@@ -349,11 +399,19 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
     def p_(x):
         return np.where(pmask, np.asarray(x, dtype=float), np.nan)
 
+    wmask = rows[["o_w", *[f"{m}_w" for m in MEMBERS]]].notna().all(axis=1).values
+
+    def w_(x):
+        return np.where(wmask, np.asarray(x, dtype=float), np.nan)
+
     configs = {
-        "new": {"label": "本系统：3 家模式加权 + 站点订正", "scores": _scores(t_(P["new_t"]), p_(P["new_p"]), rows)},
+        "new": {"label": "本系统：3 家模式加权 + 站点订正",
+                "scores": _scores(t_(P["new_t"]), p_(P["new_p"]), rows, w_(P["new_w"]))},
         "mean_bias": {"label": "3 家平均 + 统一偏差订正", "scores": _scores(t_(P["mb_t"]), p_(P["new_p"]), rows)},
-        "new_raw": {"label": "3 家模式平均（未订正）", "scores": _scores(t_(P["raw_t"]), p_(P["raw_p"]), rows)},
-        "ifs": {"label": "单一 ECMWF IFS", "scores": _scores(t_(rows["ifs_t_std"]), p_(rows["ifs_p"]), rows)},
+        "new_raw": {"label": "3 家模式平均（未订正）",
+                    "scores": _scores(t_(P["raw_t"]), p_(P["raw_p"]), rows, w_(P["raw_w"]))},
+        "ifs": {"label": "单一 ECMWF IFS", "scores": _scores(t_(rows["ifs_t_std"]), p_(rows["ifs_p"]), rows,
+                                                            w_(rows["ifs_w"]))},
     }
     pop = None
     ok = np.isfinite(P["pop"].values.astype(float)) & pmask
@@ -372,7 +430,7 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
         "window": [(first + pd.Timedelta(days=1)).date().isoformat(), (last + pd.Timedelta(days=1)).date().isoformat()],
         "days": len(inits), "stations": sorted(rows["station"].unique().tolist()),
         "order": ["new", "mean_bias", "new_raw", "ifs"], "baseline": "ifs",
-        "configs": configs, "pop": pop, "pop_label": "GEFS 21 个成员与 3 家模式经逻辑回归校准",
+        "configs": configs, "pop": pop, "pop_label": "3 家模式雨量经逻辑回归校准",
         "notes": "白天最高对比 12 时（UTC）报的 24 小时最高气温，夜间最低对比 00 时报的 24 小时最低气温；"
                  "降水为 12 小时（白天 08—20 时、夜间 20—08 时），≥0.1 mm 为有雨，微量按无雨。"
                  "全部样本外：每次预报只用发布前已结束时段的实况拟合。",

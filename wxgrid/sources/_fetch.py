@@ -22,9 +22,10 @@ _BACKOFF_CAP = 45.0
 
 #: Sustained requests per second per host. S3 answers a shared-prefix burst with
 #: 503 SlowDown and no hint about how long to wait, so the fix is not to burst.
-#: The ECMWF mirror served 35 req/s without a single 503 in 2026-10; 20 leaves room.
+#: The ECMWF mirror takes short bursts of 35 req/s, but half an hour at 20 req/s
+#: drew bucket-wide SlowDown (2026-10); 8 is sustainable.
 _HOST_RATE = {
-    "ecmwf-forecasts.s3.eu-central-1.amazonaws.com": 20.0,
+    "ecmwf-forecasts.s3.eu-central-1.amazonaws.com": 8.0,
     "data.ecmwf.int": 4.0,
     "noaa-gfs-bdp-pds.s3.amazonaws.com": 25.0,
     "noaa-gefs-pds.s3.amazonaws.com": 50.0,   # ~900 small reads per cycle (21 members x 2 per step)
