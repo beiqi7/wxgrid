@@ -69,7 +69,6 @@ def test_after_midnight_the_running_night_is_this_early_morning():
 def _ds(init="2026-09-28T00:00", steps=range(3, 145, 3), **vals):
     steps = np.asarray(list(steps))
     base = np.datetime64(init, "s")
-    n = steps.size
 
     def arr(v):
         return np.array([[v(s) if callable(v) else v for s in steps]], float)

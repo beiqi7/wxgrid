@@ -25,7 +25,6 @@ import datetime as dt
 import json
 import math
 import pathlib
-import re
 import time
 from typing import Iterable
 
