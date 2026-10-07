@@ -95,9 +95,17 @@ VERIFY_FIELDS = ("t2m", "tmax", "tmin", "u10", "v10", "tp")
 
 # ------------------------------------------------------------------ locations
 
+#: AIFS Single became operational on 2025-02-25; before that the pre-operational
+#: AIFS sat under ``aifs/`` with the same layout (2t, 10u, 10v, tp; no cloud).
+AIFS_SINGLE_FROM = dt.datetime(2025, 2, 25)
+
+
 def _ecmwf_dir(model: Model, init: dt.datetime) -> str:
     """Path of a cycle's files relative to a mirror base."""
-    product = {"ifs": "ifs", "aifs": "aifs-single"}[model.key]
+    if model.key == "aifs":
+        product = "aifs-single" if init >= AIFS_SINGLE_FROM else "aifs"
+    else:
+        product = "ifs"
     return f"{init:%Y%m%d}/{init:%H}z/{product}/0p25/oper"
 
 

@@ -252,6 +252,12 @@ def test_ecmwf_falls_back_to_the_next_mirror(monkeypatch):
     assert seen == ["https://mirror-a/x/y.index", "https://mirror-b/x/y.index"]
 
 
+def test_aifs_path_before_and_after_it_went_operational():
+    assert raw._ecmwf_dir(raw.AIFS, dt.datetime(2024, 10, 1, 12)) == "20241001/12z/aifs/0p25/oper"
+    assert raw._ecmwf_dir(raw.AIFS, dt.datetime(2025, 3, 1, 0)) == "20250301/00z/aifs-single/0p25/oper"
+    assert raw._ecmwf_dir(raw.IFS, dt.datetime(2024, 10, 1, 12)) == "20241001/12z/ifs/0p25/oper"
+
+
 def test_model_steps():
     assert raw.IFS.steps(12, 132)[:3] == [3, 6, 9] and raw.IFS.steps(12, 200)[-1] == 144
     assert raw.IFS.steps(6, 132)[-1] == 90
