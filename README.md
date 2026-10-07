@@ -311,7 +311,7 @@ python3 -m wxgrid verify --force
 systemctl daemon-reload
 ```
 
-- 一次发布实测：墙钟约 2 分钟，CPU 约 25 秒，峰值约 330 MB；按索引读约 0.8 GB GRIB 字节范围
+- 一次发布实测（3 家齐全）：墙钟约 3 分钟（含补 OGIMET 实况），CPU 约 35 秒，峰值约 400 MB；按索引读约 0.8 GB GRIB 字节范围
   （IFS 330、GFS 300、AIFS 110、GEFS 50 MB，只在内存里解码裁剪，不落盘）。
   backfill 每个时次约 1–1.5 分钟（受 AWS 限速）。
 - 切换后每次发布都把当次 4 家数据存进 `archive/`，训练集自动滚动更新，不用再跑 backfill。
