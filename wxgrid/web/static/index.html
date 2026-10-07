@@ -83,7 +83,7 @@
       <p id="towns-when" class="bsub"></p>
     </div>
     <div id="towns" class="towns"></div>
-    <p class="note">气温已按 −6.5 K/km 递减率从模式地形订正到乡镇实际海拔，同一天高山乡镇更凉。气温条从夜间最低到白天最高。点一行看该乡镇的逐3小时与各时段详情。</p>
+    <p class="note" id="towns-note">气温已按 −6.5 K/km 递减率从模式地形订正到乡镇实际海拔，同一天高山乡镇更凉。气温条从夜间最低到白天最高。点一行看该乡镇的逐3小时与各时段详情。</p>
   </section>
 
   <!-- 6. models and method -->
@@ -95,7 +95,7 @@
 
     <div class="sources" id="sources"></div>
 
-    <ol class="steps">
+    <ol class="steps" id="steps">
       <li><b>取数</b><span>向 Open-Meteo 取 8 家全球模式在每个乡镇（按真实海拔）的逐小时预报，一次请求约 200 KB。</span></li>
       <li><b>融合</b><span>8 家等权平均：各家误差来源不同，平均后互相抵消，比任何单家都稳。风按 u/v 分量平均。</span></li>
       <li><b>分时段</b><span>北京时 08—20 时为白天、20—次日 08 时为夜间；白天最高、夜间最低取各家自己的极值再平均。</span></li>
@@ -104,7 +104,7 @@
       <li><b>用语与提示</b><span>降水按 12 小时国标等级，风按蒲福风级；按暴雨、大风、高温预警信号标准检查，给出提示。</span></li>
     </ol>
 
-    <div class="formulas">
+    <div class="formulas" id="formulas">
       <figure class="fx">
         <figcaption>多模式平均</figcaption>
         <p class="eq">X̄ = <sup>1</sup>⁄<sub>n</sub> Σ<sub>k</sub> X<sub>k</sub>　（n = 8）</p>
@@ -144,7 +144,7 @@
 
     <div class="limits">
       <h3>局限，请一并看</h3>
-      <ul>
+      <ul id="limits">
         <li>订正所用的 7 个国家站（武夷山、邵武、浦城、南城、景德镇、衢州、南昌）都不在县内；最近的武夷山站在南面约 50 km。
           县城附近的上饶站不参与国际交换，拿不到实况。订正的是这一片区的共同偏差，单个乡镇的小气候（山谷冷空气、迎风坡增雨）仍体现不出来。</li>
         <li>检验窗口只有最近 30 天，且只覆盖夏末到初秋；换季时偏差会变，滚动订正需要一两周才能跟上。</li>

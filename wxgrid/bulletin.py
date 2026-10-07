@@ -90,7 +90,8 @@ def date_blocks(doc: dict) -> str:
 def render(doc: dict) -> str:
     m = doc["meta"]
     head = (f"\n{m['county']}未来五天天气预报   （{m['n_townships']}个乡镇）\n"
-            f"发布：{_issue_text(m)}（北京时）   起报：{m['run']} UTC   成员：{m['member']}\n"
+            f"发布：{_issue_text(m)}（北京时）   起报：{m.get('cycle') or m['run']} UTC   "
+            f"成员：{'、'.join(m['member_names']) if m.get('member_names') else m['member']}\n"
             + "═" * 96)
     alerts = doc["conclusions"].get("alerts") or []
     warn = ""

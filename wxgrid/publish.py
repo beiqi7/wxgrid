@@ -125,7 +125,7 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
     src = tuple(sources.split(","))
 
     issue = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    if engine == "multimodel":
+    if engine in ("multimodel", "native"):
         init = product.virtual_init(issue)
         stamp, first = init.strftime("%Y%m%d%H"), periods_mod.plan(init, issue, tz=tz, n_days=days)[0].start_local
         run = None
@@ -143,8 +143,8 @@ def publish_once(*, townships: str, county: str, seat: str, data_dir: str = DEFA
                                         sources=src, member=member, tz=tz, want_pop=want_pop,
                                         workers=workers, min_age_hours=min_age_hours, run=run,
                                         issue_utc=issue, sess=sess, hourly=hourly, engine=engine,
-                                        verify_root=data / "verify")
-    # the multi-model engine may have fallen back to a GRIB cycle with another stamp
+                                        verify_root=data / "verify", data_dir=data)
+    # the multi-model / native engines may have fallen back to a GRIB cycle with another stamp
     out = data / "runs" / f"{_slug(county)}_{prod['meta']['run']}.json"
     hourly_out = data / "hourly" / out.name
     if hdoc is not None:  # hourly first: the index marks a run hourly only once both exist
@@ -218,7 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--engine", choices=product.ENGINES, default="multimodel",
                    help="multimodel: 8 models via Open-Meteo + station calibration (default); "
-                        "grib: ECMWF IFS + GFS from the open GRIB archives")
+                        "native: ECMWF IFS/AIFS + NOAA GFS/GEFS open data + our own station-trained "
+                        "consensus, no third-party service; "
+                        "grib: ECMWF IFS + GFS from the open GRIB archives, uncalibrated")
     p.add_argument("--no-hourly", action="store_true",
                    help="skip the hourly series (saves ~80 lean GFS reads per cycle)")
     p.add_argument("--loop", action="store_true", help="run forever on the daily schedule")
