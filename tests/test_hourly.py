@@ -379,6 +379,28 @@ def test_publish_multimodel_skips_the_same_issue_window(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_publish_native_names_runs_by_issue_window_and_passes_the_data_dir(tmp_path, monkeypatch):
+    csv = tmp_path / "t.csv"
+    csv.write_text("id,name,lat,lon,elevation_m\nA,甲镇,28.3,117.7,60\n", encoding="utf-8")
+    calls = []
+
+    def fake_bundle(pts, **kw):
+        calls.append(kw)
+        meta = {"county": "测试县", "run": "2026092721", "engine": "native", "generated": "2026-09-27T23:31:00+00:00",
+                "schema": product.SCHEMA, "issue_local": "2026-09-28T07:30"}
+        return {"meta": meta, "periods": [{"start_local": "2026-09-28T08:00"}]}, {"meta": meta, "points": {}}
+
+    monkeypatch.setattr(product, "compute_bundle", fake_bundle)
+    monkeypatch.setattr(publish, "session", lambda: object())
+    kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "d"),
+              issue_utc=dt.datetime(2026, 9, 27, 23, 30), engine="native")
+    out = publish.publish_once(**kw)
+    assert out.name == "测试县_2026092721.json"
+    assert calls[0]["engine"] == "native" and str(calls[0]["data_dir"]).endswith("/d")
+    publish.publish_once(**kw)
+    assert len(calls) == 1, "same issue window, same first period: nothing to recompute"
+
+
 def test_publish_skips_a_cycle_already_on_disk_without_computing(pub):
     data, kw, calls, _ = pub
     publish.publish_once(**kw)
