@@ -46,6 +46,7 @@ from .postproc import qmap
 MEMBERS = ("ifs", "aifs", "gfs")
 DEFAULT_ROOT = pathlib.Path(os.environ.get("WXGRID_NATIVE_DIR", "/var/lib/wxgrid/native"))
 WINDOW_DAYS = 60
+OBS_DAYS = 62
 RIDGE = 1.0
 MIN_ROWS = 30
 LOWLAND_M = 500.0
@@ -459,7 +460,8 @@ def refresh(root=DEFAULT_ROOT, *, archive_root=archive.DEFAULT_ROOT, obs_root=No
             return cur
     try:
         if update_obs:
-            obs_mod.update(obs_mod.ObsStore(obs_root), stations, days=WINDOW_DAYS + 35, sess=sess, now=now)
+            # OGIMET serves about two months per request; same span as the Open-Meteo engine's archive
+            obs_mod.update(obs_mod.ObsStore(obs_root), stations, days=OBS_DAYS, sess=sess, now=now)
         tab = training_table(archive_root, obs_root, stations,
                              since=now - dt.timedelta(days=WINDOW_DAYS + 40))
         cal = fit(tab, now=now)

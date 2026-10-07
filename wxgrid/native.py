@@ -229,8 +229,8 @@ def choose_cycle(issue: dt.datetime, last_lead, *, sess=None, members=MEMBERS, m
     """Newest 00/12 UTC cycle that at least ``min_members`` members have published deep enough.
 
     ``last_lead(cycle)`` gives the hours from that cycle to the end of the
-    forecast. 00/12 UTC only: IFS 06/18 UTC stops at 90 h. Returns the cycle
-    and the members that have it.
+    forecast, or None when the cycle cannot cover any period. 00/12 UTC only:
+    IFS 06/18 UTC stops at 90 h. Returns the cycle and the members that have it.
     """
     from .sources import raw
 
@@ -239,6 +239,8 @@ def choose_cycle(issue: dt.datetime, last_lead, *, sess=None, members=MEMBERS, m
     for k in range(lookback):
         cycle = cand - dt.timedelta(hours=12 * k)
         need = last_lead(cycle)
+        if need is None:
+            continue
         have = []
         for m in members:
             model = raw.MODELS[m]
@@ -371,8 +373,11 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
         off = int((init_v - cycle).total_seconds() // 3600)
         return periods_mod.plan(init_v, issue, tz=tz, n_days=days, max_lead=raw.IFS.max_lead[0] - off)
 
-    cycle, have = choose_cycle(issue, lambda c: int((init_v - c).total_seconds() // 3600) + plan_for(c)[-1].end_lead,
-                               sess=sess, members=members)
+    def last_lead(cycle):
+        plan_c = plan_for(cycle)
+        return int((init_v - cycle).total_seconds() // 3600) + plan_c[-1].end_lead if plan_c else None
+
+    cycle, have = choose_cycle(issue, last_lead, sess=sess, members=members)
     plan = plan_for(cycle)
     steps_v = np.array(periods_mod.steps_for(plan))
     last = int((init_v - cycle).total_seconds() // 3600) + int(steps_v[-1])

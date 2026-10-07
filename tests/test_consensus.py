@@ -183,3 +183,20 @@ def test_native_compute_needs_two_members(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         native.compute(PTS, county="测试县", seat="甲镇", issue_utc=dt.datetime(2026, 10, 7, 23, 30),
                        calibrate=False, data_dir=tmp_path, stations=[])
+
+
+def test_choose_cycle_skips_cycles_that_cannot_cover_the_forecast(monkeypatch):
+    from wxgrid.sources import raw
+    seen = []
+
+    def probe(model, cycle, step, **kw):
+        seen.append((model.key, cycle, step))
+        return cycle.hour == 0                          # the 12 UTC cycle is not out yet
+    monkeypatch.setattr(raw, "probe", probe)
+    issue = dt.datetime(2026, 10, 7, 23, 30)
+    lead = {dt.datetime(2026, 10, 7, 12): 132, dt.datetime(2026, 10, 7, 0): 144}
+    cycle, have = native.choose_cycle(issue, lambda c: lead.get(c))
+    assert cycle == dt.datetime(2026, 10, 7, 0) and have == ["ifs", "aifs", "gfs"]
+    assert ("aifs", dt.datetime(2026, 10, 7, 12), 132) in seen      # AIFS rounded up to its 6 h step
+    with pytest.raises(RuntimeError):
+        native.choose_cycle(issue, lambda c: None)
