@@ -8,8 +8,9 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
 
       T = Σ_m w_m · f_m + a,       w_m ≥ 0,  Σ w_m = 1
 
-  ridge least squares toward equal weights over the last 60 days, ``a`` the
-  mean residual. Weights summing to one keep the elevation signal between
+  ridge least squares toward equal weights over the last 60 days, recent days
+  weighted more (20-day half-life, the bias drifts with the season), ``a`` the
+  weighted mean residual. Weights summing to one keep the elevation signal between
   townships intact (a free regression damps toward the station average). The
   members' values are brought to the point's elevation with −6.5 K/km by day
   and with the model's own lapse rate by night, which carries its valley
@@ -47,6 +48,11 @@ MEMBERS = ("ifs", "aifs", "gfs")
 DEFAULT_ROOT = pathlib.Path(os.environ.get("WXGRID_NATIVE_DIR", "/var/lib/wxgrid/native"))
 WINDOW_DAYS = 60
 OBS_DAYS = 62
+#: Recency half-life of the temperature fit, days (None = every day in the window alike).
+#: The members' night bias drifts with the season (+1.2 ℃ in March to −0.2 in May
+#: 2025); 20 days cut the night bias that a flat 60-day mean left in May from
+#: −0.51 to −0.37 ℃ and the mean MAE by 1.5 %.
+HALF_LIFE_DAYS: float | None = 20.0
 RIDGE = 1.0
 MIN_ROWS = 30
 LOWLAND_M = 500.0
@@ -125,28 +131,40 @@ def training_table(archive_root, obs_root, stations=obs_mod.NEAR_YANSHAN, *,
 
 # ------------------------------------------------------------------ temperature
 
-def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE) -> dict:
-    """``{kind: {lead: {"w": {member: weight}, "a": intercept, "n": pairs}}}`` from rows with observations."""
+def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE,
+                    half_life: float | None = HALF_LIFE_DAYS) -> dict:
+    """``{kind: {lead: {"w": {member: weight}, "a": intercept, "n": pairs}}}`` from rows with observations.
+
+    Pairs are weighted by recency, ``0.5 ** (age / half_life)`` days before the
+    newest one, so the fit follows a bias that drifts with the season.
+    """
     cols = [f"{m}_t" for m in members]
     out: dict[str, dict[str, dict]] = {"day": {}, "night": {}}
     if tab.empty:
         return out
     good = tab.dropna(subset=[*cols, "o_t"])
+    newest = good["end"].max() if len(good) else None
     for (kind, lead), g in good.groupby(["kind", "lead"]):
         if len(g) < MIN_ROWS:
             continue
         F = g[cols].values
         y = g["o_t"].values
+        if half_life:
+            age = (newest - g["end"]).dt.total_seconds().values / 86400.0
+            s = 0.5 ** (age / half_life)
+        else:
+            s = np.ones(len(y))
+        s = s / s.mean()
         fm = F.mean(axis=1)
         X = np.column_stack([np.ones(len(y)), (F - fm[:, None])[:, :-1]])
         R = ridge * len(y) * np.eye(X.shape[1])
         R[0, 0] = 0.0
-        beta = np.linalg.solve(X.T @ X + R, X.T @ (y - fm))
+        beta = np.linalg.solve((X * s[:, None]).T @ X + R, (X * s[:, None]).T @ (y - fm))
         w = np.r_[beta[1:], 0.0] + 1.0 / len(cols)
         w[-1] = 1.0 - w[:-1].sum()
         w = np.clip(w, 0.0, None)
         w = w / w.sum() if w.sum() > 0 else np.full(len(cols), 1.0 / len(cols))
-        a = float(np.mean(y - F @ w))
+        a = float(np.average(y - F @ w, weights=s))
         out[kind][str(int(lead))] = {"w": {m: round(float(x), 4) for m, x in zip(members, w)},
                                      "a": round(a, 3), "n": int(len(g))}
     return out
