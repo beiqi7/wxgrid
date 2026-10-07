@@ -16,7 +16,8 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
   and with the model's own lapse rate by night, which carries its valley
   inversions (:func:`wxgrid.native.point_values`).
 * **Precipitation** — 12 h totals of the member mean, quantile-mapped from the
-  forecast to the observed climatology of the window.
+  forecast to the observed climatology of the window, recent days weighted
+  more (14-day half-life).
 * **Wind** — speed is the mean of the members' speeds times a ratio of
   means per period kind (the models run ~20 % light against these
   stations); direction from the averaged vector.
@@ -53,6 +54,11 @@ OBS_DAYS = 62
 #: 2025); 20 days cut the night bias that a flat 60-day mean left in May from
 #: −0.51 to −0.37 ℃ and the mean MAE by 1.5 %.
 HALF_LIFE_DAYS: float | None = 20.0
+#: Same for the precipitation quantile maps and the PoP fit. With a flat window,
+#: autumn 2024 still mapped October through a wetter September: rain frequency
+#: bias 0.64 at day 1 and TS(>=5 mm) 12. 14 days: 0.71 and 18, with spring-summer
+#: 2025 unchanged (PC 82.2 -> 82.5, TS 58.2 -> 58.9).
+PRECIP_HALF_LIFE_DAYS: float | None = 14.0
 RIDGE = 1.0
 MIN_ROWS = 30
 LOWLAND_M = 500.0
@@ -194,25 +200,48 @@ def combine_temperature(cal_t: dict | None, kind: str, lead: int, values: dict[s
 
 # ------------------------------------------------------------------ precipitation
 
-def qmap_fit(f, o, n: int = 401) -> dict | None:
-    """Forecast and observed climatologies of 12 h totals, in :func:`wxgrid.postproc.qmap` form."""
+def _wquantile(x: np.ndarray, w: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Weighted quantiles (``np.quantile``'s linear rule when all weights are equal)."""
+    order = np.argsort(x, kind="stable")
+    x, w = x[order], w[order]
+    cw = np.cumsum(w)
+    pos = (cw - w[0]) / (cw[-1] - w[0]) if cw[-1] > w[0] else np.linspace(0.0, 1.0, x.size)
+    return np.interp(p, pos, x)
+
+
+def qmap_fit(f, o, n: int = 401, weights=None) -> dict | None:
+    """Forecast and observed climatologies of 12 h totals, in :func:`wxgrid.postproc.qmap` form.
+
+    ``weights`` (e.g. recency) weight each pair in both climatologies.
+    """
     f, o = np.asarray(f, dtype=float), np.asarray(o, dtype=float)
-    ok = np.isfinite(f) & np.isfinite(o)
-    f, o = f[ok], o[ok]
+    w = np.ones(f.size) if weights is None else np.asarray(weights, dtype=float)
+    ok = np.isfinite(f) & np.isfinite(o) & np.isfinite(w)
+    f, o, w = f[ok], o[ok], w[ok]
     if f.size < 60:
         return None
     p = np.linspace(0.0, 1.0, n)
-    return {"p": p.round(5).tolist(), "fq": np.quantile(f, p).round(3).tolist(),
-            "oq": np.quantile(o, p).round(3).tolist(), "n": int(f.size)}
+    return {"p": p.round(5).tolist(), "fq": _wquantile(f, w, p).round(3).tolist(),
+            "oq": _wquantile(o, w, p).round(3).tolist(), "n": int(f.size)}
+
+
+def recency_weights(tab: pd.DataFrame, half_life: float | None) -> np.ndarray:
+    """``0.5 ** (age / half_life)`` with age in days before the newest period in ``tab``."""
+    if not half_life or tab.empty:
+        return np.ones(len(tab))
+    age = (tab["end"].max() - tab["end"]).dt.total_seconds().values / 86400.0
+    return 0.5 ** (age / half_life)
 
 
 def member_mean_precip(tab: pd.DataFrame, members=MEMBERS) -> pd.Series:
     return tab[[f"{m}_p" for m in members]].mean(axis=1, skipna=False)
 
 
-def fit_precip(tab: pd.DataFrame, *, members=MEMBERS) -> dict:
+def fit_precip(tab: pd.DataFrame, *, members=MEMBERS, half_life: float | None = None) -> dict:
     mean = member_mean_precip(tab, members)
-    return {k: qmap_fit(mean[tab["kind"] == k], tab.loc[tab["kind"] == k, "o_p"]) for k in ("day", "night")}
+    w = recency_weights(tab, half_life if half_life is not None else PRECIP_HALF_LIFE_DAYS)
+    return {k: qmap_fit(mean[tab["kind"] == k], tab.loc[tab["kind"] == k, "o_p"], weights=w[(tab["kind"] == k).values])
+            for k in ("day", "night")}
 
 
 def map_precip(cal_p: dict | None, kind: str, total) -> np.ndarray:
@@ -245,14 +274,15 @@ def wind_factor(cal: dict | None, kind: str) -> float:
 
 # ------------------------------------------------------------------ probability
 
-def _logit_fit(X: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 50) -> np.ndarray:
+def _logit_fit(X: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 50, sample_weight=None) -> np.ndarray:
     X1 = np.column_stack([np.ones(len(y)), X])
+    s = np.ones(len(y)) if sample_weight is None else np.asarray(sample_weight, dtype=float) / np.mean(sample_weight)
     w = np.zeros(X1.shape[1])
     pen = l2 * np.r_[0.0, np.ones(len(w) - 1)]
     for _ in range(iters):
         p = 1.0 / (1.0 + np.exp(-np.clip(X1 @ w, -30, 30)))
-        g = X1.T @ (p - y) + pen * w
-        H = (X1 * (p * (1 - p))[:, None]).T @ X1 + np.diag(pen)
+        g = X1.T @ (s * (p - y)) + pen * w
+        H = (X1 * (s * p * (1 - p))[:, None]).T @ X1 + np.diag(pen)
         step = np.linalg.solve(H, g)
         w -= step
         if np.abs(step).max() < 1e-6:
@@ -270,7 +300,7 @@ def pop_features(member_totals: dict[str, np.ndarray], cal_pm: dict | None, kind
     return np.column_stack([wet, lm])
 
 
-def fit_pop(tab: pd.DataFrame, *, members=MEMBERS) -> dict:
+def fit_pop(tab: pd.DataFrame, *, members=MEMBERS, half_life: float | None = None) -> dict:
     """Per kind: each member's quantile map and logistic coefficients on :func:`pop_features`.
 
     The GEFS share was tried as a third predictor and added nothing (Brier skill
@@ -280,11 +310,13 @@ def fit_pop(tab: pd.DataFrame, *, members=MEMBERS) -> dict:
     out: dict[str, Any] = {"member_qmap": {}, "logit": {}}
     for kind in ("day", "night"):
         g = tab[tab["kind"] == kind].dropna(subset=["o_p", *[f"{m}_p" for m in members]])
-        out["member_qmap"][kind] = {m: qmap_fit(g[f"{m}_p"], g["o_p"]) for m in members}
+        w = recency_weights(g, half_life if half_life is not None else PRECIP_HALF_LIFE_DAYS)
+        out["member_qmap"][kind] = {m: qmap_fit(g[f"{m}_p"], g["o_p"], weights=w) for m in members}
         if len(g) < 80:
             continue
         X = pop_features({m: g[f"{m}_p"].values for m in members}, out["member_qmap"], kind)
-        out["logit"][kind] = [round(float(x), 5) for x in _logit_fit(X, (g["o_p"].values >= WET_MM).astype(float))]
+        out["logit"][kind] = [round(float(x), 5) for x in
+                              _logit_fit(X, (g["o_p"].values >= WET_MM).astype(float), sample_weight=w)]
     return out
 
 
