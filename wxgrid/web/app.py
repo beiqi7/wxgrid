@@ -281,7 +281,8 @@ _HOUR_FIELDS = ("weather", "temp", "precip", "snow", "cloud", "wind_speed", "win
 
 #: Per-period fields copied into the one-township forecast view.
 _PERIOD_FIELDS = ("weather", "temp", "tmax", "tmin", "precip", "snow", "wind_text", "wind_name",
-                  "force_text", "force_lo", "force_hi", "gust", "gust_force", "windows_text", "pop")
+                  "force_text", "force_lo", "force_hi", "gust", "gust_force", "windows_text", "pop",
+                  "pop_moderate", "pop_heavy")
 
 
 def _find_township(doc: dict, key: str) -> dict | None:

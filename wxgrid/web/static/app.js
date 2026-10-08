@@ -205,7 +205,7 @@ function popNote(threeHourly) {
   if (m.pop_source === 'native') {
     return threeHourly
       ? `降水概率为 NOAA GEFS ${m.pop_members || 21} 个成员中所在 6 小时有 ≥0.1 mm 降水的比例，仅作明细参考。`
-      : `降水概率由 3 家模式的雨量经逻辑回归校准（按周边国家站实况拟合），仅作明细参考。`;
+      : `降水概率、中雨以上（12 小时 ≥5 mm）与大雨以上（≥15 mm）概率由 3 家模式的雨量经逻辑回归校准（按周边国家站实况拟合），仅作明细参考。`;
   }
   if (m.pop_source === 'multimodel') {
     return `降水概率为 ${m.pop_members || 8} 家模式中（各自订正后）${threeHourly ? '该 3 小时' : '该时段'}有 ≥0.1 mm 降水的比例，仅作明细参考。`;
@@ -302,6 +302,15 @@ function renderAlerts() {
       <span class="a-when">${dateList(a.dates)}</span>
     </div>`).join('') +
     '<p class="a-foot">据模式预报推算，仅作提示；以当地气象台发布的预警信号为准。</p>';
+}
+
+/** System warnings (native engine): a member missing, the calibration stale, the live scores off. */
+function renderHealth() {
+  const box = $('health');
+  const list = S.doc.meta.health || [];
+  box.hidden = !list.length;
+  box.innerHTML = list.map(t => `
+    <div class="alert a-note"><span class="a-type">运行</span><span class="a-what">${esc(t)}</span></div>`).join('');
 }
 
 /* ---------- 3. 0–72 h every 3 hours ---------- */
@@ -592,11 +601,18 @@ function renderTowns() {
 }
 
 /* ---------- township sheet: 3-hourly + every period, with probabilities ---------- */
+/** 中雨以上 (and 大雨以上 when there is a fit for it) probability, to the nearest 10 %. */
+function heavyText(c) {
+  if (c.pop_moderate === null || c.pop_moderate === undefined) return '—';
+  const r = x => `${Math.round(x / 10) * 10}%`;
+  return c.pop_heavy === null || c.pop_heavy === undefined ? r(c.pop_moderate) : `${r(c.pop_moderate)} / ${r(c.pop_heavy)}`;
+}
 function openSheet(id, from) {
   const t = S.doc.townships.find(x => x.id === id);
   if (!t) return;
   const dz = (t.elevation ?? 0) - (t.model_elevation ?? 0);
   const corr = -dz * 0.0065;
+  const heavyCol = livePeriods().some(q => { const c = cellOf(q, id); return c && c.pop_moderate != null; });
   const rows = livePeriods().map((q, i) => {
     const c = cellOf(q, id);
     if (!c) return '';
@@ -609,6 +625,7 @@ function openSheet(id, from) {
       <td class="s-num">${(c.precip ?? 0) >= 0.05 ? `${n1(c.precip, 1)} mm` : '—'}</td>
       <td class="s-win">${esc(c.windows_text || '—')}</td>
       <td class="s-num">${c.pop === null || c.pop === undefined ? '—' : `${Math.round(c.pop / 10) * 10}%`}</td>
+      ${heavyCol ? `<td class="s-num">${heavyText(c)}</td>` : ''}
     </tr>`;
   }).join('');
   const href = `/api/forecast/${encodeURIComponent(id)}${S.file ? `?run=${encodeURIComponent(S.file)}` : ''}`;
@@ -623,7 +640,8 @@ function openSheet(id, from) {
     <h4 class="s-h">白天 / 夜间</h4>
     <div class="s-wrap"><table class="s-table">
       <thead><tr><th scope="col">时段</th><th scope="col">天气</th><th scope="col">气温</th><th scope="col">风</th>
-        <th scope="col">降水</th><th scope="col">降水时段</th><th scope="col">降水概率</th></tr></thead>
+        <th scope="col">降水</th><th scope="col">降水时段</th><th scope="col">降水概率</th>${
+          heavyCol ? '<th scope="col">中雨 / 大雨以上</th>' : ''}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
     <p class="ht-api">${esc(popNote(false))}
@@ -681,8 +699,8 @@ const NATIVE_METHOD = {
       <li><b>降尺度</b><span>双线性插值到乡镇；气温按海拔订正，白天用标准递减率，夜间用模式自己在当地的递减率。</span></li>
       <li><b>加权融合</b><span>3 家加权平均：权重按白天/夜间、预报第几天，用周边国家站过去 60 天实况拟合，非负、合计为 1、向等权收缩。风按 u/v 平均。</span></li>
       <li><b>分时段</b><span>北京时 08—20 时为白天、20—次日 08 时为夜间；白天最高、夜间最低取各家自己的极值再加权。</span></li>
-      <li><b>气温订正</b><span>同一拟合里的系统偏差一并扣除，每天用最新实况重新拟合。</span></li>
-      <li><b>降水订正</b><span>12 小时雨量按"预报气候 → 实况气候"做分位数映射：去掉平均带来的毛毛雨，把偏弱的大雨调回来。</span></li>
+      <li><b>气温订正</b><span>同一拟合里的系统偏差一并扣除；夜间最低再按风速订正（静风夜辐射降温强，模式报得偏暖，有风的夜里不偏）。每天用最新实况重新拟合。</span></li>
+      <li><b>降水订正</b><span>12 小时雨量按"预报气候 → 实况气候"做分位数映射：去掉平均带来的毛毛雨，把偏弱的大雨调回来。明细另给降水概率与中雨以上、大雨以上概率，同样按实况校准。</span></li>
       <li><b>用语与提示</b><span>降水按 12 小时国标等级，风按蒲福风级；按暴雨、大风、高温预警信号标准检查，给出提示。</span></li>`,
   formulas: `
       <figure class="fx">
@@ -697,9 +715,19 @@ const NATIVE_METHOD = {
         <p class="fx-note">夜间的 γ 从模式自己的气温与地形回归得到（周边 5×5 格点），山谷逆温时可为正。</p>
       </figure>
       <figure class="fx">
+        <figcaption>夜间风速项</figcaption>
+        <p class="eq">T<sub>夜</sub>′ = T<sub>夜</sub> + b (ln v − <span class="ovl">ln v</span>)</p>
+        <p class="fx-note">v 为 3 家模式夜间风速的平均，b 与平均值都在同一 60 天窗口里拟合；静风夜往冷调、有风夜往暖调，平均不变。</p>
+      </figure>
+      <figure class="fx">
         <figcaption>降水分位数映射</figcaption>
         <p class="eq">P′ = F<sub>实况</sub><sup>−1</sup>( F<sub>预报</sub>(P) )</p>
         <p class="fx-note">按白天、夜间分别拟合；时段内各 3 小时雨量同比例缩放，时段总量与逐3小时一致。</p>
+      </figure>
+      <figure class="fx">
+        <figcaption>中雨、大雨以上概率</figcaption>
+        <p class="eq">P(R ≥ c<sub>j</sub>) = σ(a + δ<sub>j</sub> + β·x)　（c = 0.1, 5, 15 mm）</p>
+        <p class="fx-note">x 为 3 家映射后的雨量（封顶 10 mm 取对数）与有雨、≥5 mm 的家数比例；三个门槛共用斜率，罕见的大雨借用常见降水的信息，概率天然有序。</p>
       </figure>`,
   limits: `
         <li>订正所用的 7 个国家站（武夷山、邵武、浦城、南城、景德镇、衢州、南昌）都不在县内；最近的武夷山站在南面约 50 km。
@@ -707,7 +735,7 @@ const NATIVE_METHOD = {
         <li>只有 3 家确定性模式（IFS、AIFS、GFS）。拟合窗口 60 天，换季时权重和偏差要一两周才能跟上。</li>
         <li>刚部署时要先用 <code>backfill</code> 从 AWS 上的历史数据补齐 60 天存档；存档不足时只做等权平均、不订正。</li>
         <li>某家模式当次没发布时少一家照常出预报（至少 2 家），权重按比例补足。</li>
-        <li>明细表里的降水概率经过校准，但只作参考，不进入预报用语。</li>
+        <li>明细表里的降水概率、中雨以上与大雨以上概率经过校准，但只作参考，不进入预报用语；窗口里大雨样本不足时不给大雨以上概率。</li>
         <li>全自动生成，未经预报员订正，不能替代气象部门发布的预报和预警信号。</li>`,
 };
 const METHOD_DEFAULT = {};
@@ -790,7 +818,58 @@ function renderAccuracy() {
     </table></div>
     ${v.pop ? `<p class="note">明细里的降水概率（${esc(v.pop_label || '8 家模式各自订正后的有雨比例')}）：Brier 技巧评分 ${n1(v.pop.bss * 100)}%（相对气候概率）；
       ${v.pop.reliability.filter(r => r.n).map(r => `预报 ${Math.round(r.bin[0] * 100)}—${Math.round(r.bin[1] * 100)}% 时实况有雨 ${n1(r.observed * 100)}%`).join('，')}。</p>` : ''}
-    <p class="note">${esc(v.notes || '')} 每列最好的成绩加粗。</p>`;
+    ${heavyNote(v.heavy)}${frostNote(v.frost)}
+    <p class="note">${esc(v.notes || '')} 每列最好的成绩加粗。</p>
+    ${liveBlock(v.live)}`;
+}
+
+function heavyNote(h) {
+  if (!h) return '';
+  const name = { '5': '中雨以上（12 小时 ≥5 mm）', '15': '大雨以上（≥15 mm）' };
+  const parts = Object.entries(h).filter(([, x]) => x && Number.isFinite(x.bss)).map(([k, x]) =>
+    `${name[k] || `≥${k} mm`}概率 Brier 技巧 ${n1(x.bss * 100)}%（${x.events} 次）`);
+  return parts.length ? `<p class="note">明细里的${parts.join('，')}，均相对气候概率。</p>` : '';
+}
+
+function frostNote(f) {
+  if (!f) return '';
+  const ls = ['1', '3', '5'].filter(l => f[l] && f[l].events);
+  if (!ls.length) return '';
+  return `<p class="note">霜冻（夜间最低 ≤0 ℃）：${ls.map(l =>
+    `第${l}天实况 ${f[l].events} 次、报中 ${f[l].hits} 次、空报 ${f[l].false_alarms} 次`).join('；')}。</p>`;
+}
+
+/** Scores of the forecasts as actually issued, and the monthly day-1 history. */
+function liveBlock(lv) {
+  if (!lv || !lv.scores) return '';
+  const leads = ['1', '2', '3', '4', '5'];
+  const g = (l, f, k) => { const x = ((lv.scores[l] || lv.scores[Number(l)] || {})[f] || {})[k]; return Number.isFinite(x) ? x : null; };
+  const row = (label, f, k, fmt) => `<tr><th scope="row">${label}</th>${leads.map(l => {
+    const x = g(l, f, k); return `<td>${x === null ? '—' : fmt(x)}</td>`; }).join('')}</tr>`;
+  const months = Object.entries(lv.months || {}).sort().reverse().slice(0, 12);
+  const hist = months.length ? `
+    <div class="acc-wrap"><table class="acc-t">
+      <thead><tr><th scope="col">月份（第1天）</th><th scope="col">发布次数</th><th scope="col">白天最高 MAE</th>
+        <th scope="col">夜间最低 MAE</th><th scope="col">晴雨</th></tr></thead>
+      <tbody>${months.map(([m, x]) => `<tr><th scope="row">${esc(m)}</th><td>${x.issues}</td>
+        <td>${Number.isFinite(x.tmax_mae) ? `${n1(x.tmax_mae, 2)} ℃` : '—'}</td>
+        <td>${Number.isFinite(x.tmin_mae) ? `${n1(x.tmin_mae, 2)} ℃` : '—'}</td>
+        <td>${Number.isFinite(x.rain_pc) ? `${n1(x.rain_pc)}%` : '—'}</td></tr>`).join('')}</tbody>
+    </table></div>` : '';
+  return `
+    <h3 class="acc-sub">实际发布的预报 · ${md(lv.window[0])}—${md(lv.window[1])} · ${lv.issues} 次发布${
+      lv.short_member_issues ? `（其中 ${lv.short_member_issues} 次缺成员）` : ''}</h3>
+    <div class="acc-wrap"><table class="acc-t">
+      <thead><tr><th scope="col">指标</th>${leads.map(l => `<th scope="col">第${l}天</th>`).join('')}</tr></thead>
+      <tbody>
+        ${row('白天最高 MAE', 'tmax', 'mae', x => `${n1(x, 2)} ℃`)}
+        ${row('夜间最低 MAE', 'tmin', 'mae', x => `${n1(x, 2)} ℃`)}
+        ${row('晴雨准确率', 'rain', 'pc', x => `${n1(x)}%`)}
+        ${row('降水 TS', 'rain', 'ts', x => `${x.toFixed(0)}`)}
+      </tbody>
+    </table></div>
+    ${hist}
+    <p class="note">${esc(lv.notes || '')}</p>`;
 }
 function renderText() { $('doc-text').textContent = S.doc.text || ''; }
 
@@ -859,6 +938,7 @@ function bjTime(iso) {
 function paint() {
   renderToday();
   renderAlerts();
+  renderHealth();
   renderTownPicker();
   render3h();
   renderWeek();
