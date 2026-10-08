@@ -78,8 +78,9 @@ NIGHT_WIND_MS = (0.3, 8.0)
 #: 12 h thresholds of the extra probabilities: 中雨以上, 大雨以上 (CMA 12 h grades).
 HEAVY_MM = (5.0, 15.0)
 #: The mapped member mean enters the heavy-rain logit capped here: uncapped, a
-#: 30 mm forecast read as near-certain >=15 mm at the station (backtest: 0.89
-#: forecast, 0.44 observed); capped, Brier skill for >=15 mm 0.15 -> 0.24.
+#: 30 mm forecast read as near-certain >=15 mm at the station (spring-summer 2025,
+#: separate fits: 0.72 forecast on average above 50 %, 0.42 observed); capped and
+#: cumulative, Brier skill for >=15 mm 0.14 -> 0.25.
 HEAVY_CAP_MM = 10.0
 #: Fewest events in the window to publish each extra probability.
 HEAVY_MIN_EVENTS = {5.0: 20, 15.0: 8}
