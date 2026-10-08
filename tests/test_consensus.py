@@ -170,6 +170,10 @@ def test_native_compute_end_to_end(tmp_path, monkeypatch):
     assert hi["T1"] - hi["T2"] == pytest.approx(0.0065 * 540, abs=0.05)   # daytime: standard lapse rate
     pops = [c["pop"] for q in prod["periods"] for c in q["cells"]]
     assert all(p is not None and 0 <= p <= 100 for p in pops)
+    # uncalibrated: no 中雨 / 大雨以上 probabilities, and the page is told why
+    assert all(c["pop_moderate"] is None and c["pop_heavy"] is None for q in prod["periods"] for c in q["cells"])
+    assert prod["periods"][0]["county"]["pop_moderate_max"] is None
+    assert any("订正未生效" in h for h in m["health"])
     assert prod["series3h"]["points"]["T1"]["temp"][0] is not None
     assert hdoc["meta"]["n_hours"] > 100
     for src in ("ifs", "aifs", "gfs", "gefs"):

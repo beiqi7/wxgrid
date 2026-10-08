@@ -65,7 +65,10 @@ HALF_LIFE_DAYS: float | None = 20.0
 #: bias 0.64 at day 1 and TS(>=5 mm) 12. 14 days: 0.71 and 18, with spring-summer
 #: 2025 unchanged (PC 82.2 -> 82.5, TS 58.2 -> 58.9).
 PRECIP_HALF_LIFE_DAYS: float | None = 14.0
-RIDGE = 1.0
+#: Ridge toward equal weights, per lead day. Further out the members' skill
+#: differences shrink against the noise of a 60-day fit: 1/1/2/4/8 against a flat 1
+#: cut the day-5 MAE by 0.01–0.04 ℃ in all three backtest seasons, days 1–2 unchanged.
+RIDGE = {1: 1.0, 2: 1.0, 3: 2.0, 4: 4.0, 5: 8.0}
 MIN_ROWS = 30
 LOWLAND_M = 500.0
 WET_MM = verify.WET_MM
@@ -153,7 +156,7 @@ def training_table(archive_root, obs_root, stations=obs_mod.NEAR_YANSHAN, *,
 
 # ------------------------------------------------------------------ temperature
 
-def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE,
+def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float | dict = RIDGE,
                     half_life: float | None = HALF_LIFE_DAYS) -> dict:
     """``{kind: {lead: {"w": {member: weight}, "a": intercept, "n": pairs}}}`` from rows with observations.
 
@@ -179,7 +182,8 @@ def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE,
         s = s / s.mean()
         fm = F.mean(axis=1)
         X = np.column_stack([np.ones(len(y)), (F - fm[:, None])[:, :-1]])
-        R = ridge * len(y) * np.eye(X.shape[1])
+        lam = ridge.get(int(lead), max(ridge.values())) if isinstance(ridge, dict) else ridge
+        R = lam * len(y) * np.eye(X.shape[1])
         R[0, 0] = 0.0
         beta = np.linalg.solve((X * s[:, None]).T @ X + R, (X * s[:, None]).T @ (y - fm))
         w = np.r_[beta[1:], 0.0] + 1.0 / len(cols)
@@ -564,26 +568,29 @@ def _scores(f_t, f_p, rows: pd.DataFrame, f_w=None) -> dict[int, dict]:
 
 
 def prob_scores(f, o_amount, thr: float, clim: float, mask, lead=None, *,
-                bins=((0.0, 0.2), (0.2, 0.5), (0.5, 0.8), (0.8, 1.01)), min_n: int = 50) -> dict | None:
+                bins=((0.0, 0.2), (0.2, 0.5), (0.5, 0.8), (0.8, 1.01)), min_n: int = 50,
+                min_events: int = 0) -> dict | None:
     """Brier score, skill against the climatological frequency ``clim`` and reliability of
-    probabilities ``f`` (0–1) for "observed amount ≥ ``thr``"; ``bss_by_lead`` when ``lead`` is given."""
+    probabilities ``f`` (0–1) for "observed amount ≥ ``thr``"; ``bss_by_lead`` when ``lead`` is given.
+    With fewer than ``min_events`` events the skill is not computed (None): one wet day decides it."""
     f, o_amount = np.asarray(f, dtype=float), np.asarray(o_amount, dtype=float)
     ok = np.asarray(mask, dtype=bool) & np.isfinite(f) & np.isfinite(o_amount)
     if ok.sum() < min_n:
         return None
     fo, o = f[ok], (o_amount[ok] >= thr).astype(float)
     bs, bc = float(((fo - o) ** 2).mean()), float(((clim - o) ** 2).mean())
+    enough = o.sum() >= min_events
     out = {"n": int(ok.sum()), "events": int(o.sum()), "brier": bs, "brier_climatology": bc,
-           "bss": 1 - bs / bc if bc > 0 else None,
+           "bss": 1 - bs / bc if bc > 0 and enough else None,
            "reliability": [{"bin": [a, min(b, 1.0)], "n": int(((fo >= a) & (fo < b)).sum()),
                             "observed": float(o[(fo >= a) & (fo < b)].mean()) if ((fo >= a) & (fo < b)).any() else None}
                            for a, b in bins]}
-    if lead is not None:
+    if lead is not None and enough:
         lo = np.asarray(lead)[ok]
         by = {}
         for ld in verify.LEADS:
             s = lo == ld
-            c1 = float(((clim - o[s]) ** 2).mean()) if s.sum() >= 20 else 0.0
+            c1 = float(((clim - o[s]) ** 2).mean()) if s.sum() >= 20 and o[s].sum() >= min_events / 2 else 0.0
             by[str(ld)] = 1 - float(((fo[s] - o[s]) ** 2).mean()) / c1 if c1 > 0 else None
         out["bss_by_lead"] = by
     return out
@@ -672,7 +679,7 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
     heavy = {}
     for thr, col in zip(HEAVY_MM, ("p5", "p15")):
         sc = prob_scores(P[col].values, rows["o_p"].values, thr, float((before >= thr).mean()), pmask,
-                         rows["lead"].values, bins=((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.01)))
+                         rows["lead"].values, bins=((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.01)), min_events=10)
         if sc:
             heavy[f"{thr:g}"] = sc
     first, last = rows["init"].min(), rows["init"].max()

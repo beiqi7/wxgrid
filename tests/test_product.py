@@ -190,3 +190,23 @@ def test_series_3h_starts_after_the_issue_time_and_runs_72_hours():
     assert s["times"][0] == "2026-09-28T08:00" and len(s["times"]) == 24
     assert s["lead_h"][0] == 12
     assert s["points"]["A"]["weather"][0] == "晴" and s["points"]["A"]["wind_force"][0] == 2
+
+
+def test_heavy_rain_probabilities_reach_cells_county_and_api():
+    from wxgrid.web.app import township_periods
+    ds = _ds(precip=lambda s: 2.0 if 15 <= s <= 24 else 0.0)
+    issue = dt.datetime.fromisoformat("2026-09-28T07:30") - dt.timedelta(hours=8)
+    plan = periods.plan(np.datetime64(ds.attrs["init_time"]), issue)
+    n = len(plan)
+    pop = np.full((1, n), 80.0)
+    heavy = {"moderate": np.full((1, n), 41.0), "heavy": np.full((1, n), np.nan)}
+    doc = product.build(ds, periods=plan, issue_utc=issue, county="测试县", seat="甲镇", run="2026092800",
+                        member="native", sources=("ifs",), weights=None, tz=8.0, period_pop=pop,
+                        period_pop_heavy=heavy)
+    c = doc["periods"][0]["cells"][0]
+    assert (c["pop"], c["pop_moderate"], c["pop_heavy"]) == (80, 41, None)
+    assert doc["periods"][0]["county"]["pop_moderate_max"] == 41 and doc["periods"][0]["county"]["pop_heavy_max"] is None
+    row = township_periods(doc, "甲镇")["periods"][0]
+    assert row["pop_moderate"] == 41
+    # other engines: the keys exist and are empty
+    assert _doc(_ds())["periods"][0]["cells"][0]["pop_moderate"] is None
