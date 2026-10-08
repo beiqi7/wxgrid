@@ -1,0 +1,6 @@
+# Lint gate for CI: syntax errors and pyflakes (undefined names, unused imports,
+# unused variables). Style is left to review.
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]

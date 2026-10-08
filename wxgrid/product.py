@@ -471,7 +471,7 @@ def choose_run(sources: tuple[str, ...], issue_utc, *, n_days: int, tz: float, s
     raise RuntimeError(f"no recent cycle of {sources} reaches the forecast periods")
 
 
-ENGINES = ("multimodel", "grib")
+ENGINES = ("multimodel", "native", "grib")
 
 
 def virtual_init(issue_utc) -> dt.datetime:
@@ -565,12 +565,17 @@ def compute_bundle(points: list[Township], *, county: str, seat: str, days: int 
                    pad: float = 0.75, want_pop: bool = True, workers: int = 4,
                    min_age_hours: float | None = None, run=None, issue_utc=None, sess=None,
                    hourly: bool = False, engine: str = "multimodel", calibrate: bool = True,
-                   verify_root=None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+                   verify_root=None, data_dir=None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """``(product, hourly)``; ``hourly`` is None unless requested.
 
     ``engine="multimodel"`` (default) uses eight models via Open-Meteo with
     station calibration and falls back to ``"grib"`` — ECMWF IFS + GFS from their
     open GRIB archives, downscaled here — when Open-Meteo cannot be reached.
+    ``engine="native"`` reads ECMWF IFS + AIFS and NOAA GFS + GEFS from the
+    producers' open data and combines them with the station-trained consensus
+    of :mod:`wxgrid.consensus` (no third-party service; see :mod:`wxgrid.native`);
+    it too falls back to ``"grib"``. ``data_dir`` holds its run archive and
+    calibration (default ``/var/lib/wxgrid``).
     ``run`` pins a GRIB cycle and implies the GRIB engine. ``issue_utc`` (naive
     UTC, default now) decides the first period.
     """
@@ -578,6 +583,16 @@ def compute_bundle(points: list[Township], *, county: str, seat: str, days: int 
         raise ValueError(f"engine must be one of {ENGINES}")
     sess = sess or pipeline.session()
     issue_utc = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    if engine == "native" and run is None:
+        from . import native
+        try:
+            return native.compute(points, county=county, seat=seat, days=days, tz=tz, want_pop=want_pop,
+                                  workers=max(workers, 8), issue_utc=issue_utc, sess=sess, hourly=hourly,
+                                  calibrate=calibrate, data_dir=data_dir)
+        except Exception as exc:  # noqa: BLE001 — never go without a forecast
+            import sys
+            print(f"[product] native engine failed ({type(exc).__name__}: {exc}); "
+                  "falling back to ECMWF+GFS GRIB", file=sys.stderr, flush=True)
     if engine == "multimodel" and run is None:
         try:
             return compute_multimodel(points, county=county, seat=seat, days=days, tz=tz, want_pop=want_pop,

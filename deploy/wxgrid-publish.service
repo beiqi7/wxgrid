@@ -11,6 +11,9 @@ Type=oneshot
 WorkingDirectory=/opt/wxgrid
 Environment=PYTHONUNBUFFERED=1
 Environment=WXGRID_CACHE=/var/lib/wxgrid/cache
+# Engine: the default is the 8-model Open-Meteo one. To run without Open-Meteo,
+# seed the archive once (`python3 -m wxgrid backfill --townships ... --days 60`)
+# and add `--engine native` below; see README「自主引擎」.
 ExecStart=/usr/bin/python3 -m wxgrid publish \
     --townships /opt/wxgrid/yanshan_townships.csv \
     --county 铅山县 --seat 河口镇 \

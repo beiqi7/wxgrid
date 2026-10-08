@@ -22,7 +22,7 @@ import xarray as xr
 
 from ..runs import Run
 from ._fetch import decode_grib, get, head_ok, session
-from .gfs import _parse_idx, _window_start
+from .gfs import _parse_idx
 
 BUCKET = "https://noaa-gefs-pds.s3.amazonaws.com"
 

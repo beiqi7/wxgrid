@@ -25,7 +25,6 @@ import datetime as dt
 import json
 import math
 import pathlib
-import re
 import time
 from typing import Iterable
 
@@ -157,6 +156,16 @@ def decode(report: str) -> dict | None:
                 out["tx24"] = _temp(g)
             elif d == "2" and last_digit < 2:
                 out["tn24"] = _temp(g)
+            elif d == "6" and last_digit < 6:
+                # Some stations send the 12 h amount in section 1 and the 6 h one
+                # here (``333 ... 6RRR1``); without this their p6 was lost.
+                hours = _TR_HOURS.get(g[4])
+                amt = _rrr(g[1:4])
+                if hours == 6:
+                    out["p6"] = amt
+                    p6_seen = True
+                elif hours:
+                    out.setdefault(f"p{hours}", amt)
             elif d == "7" and last_digit < 7:
                 v = g[1:5]
                 if "/" not in v:
@@ -190,6 +199,62 @@ def parse_ogimet(text: str) -> list[dict]:
         rec["time"] = t.strftime("%Y-%m-%dT%H:%M")
         rows.append(rec)
     return rows
+
+
+def parse_isd(text: str) -> list[dict]:
+    """NOAA ISD full-format lines -> records like :func:`parse_ogimet`'s.
+
+    ISD (``noaa-isd-pds`` on AWS) relays the same SYNOP reports. Where a line
+    still carries the bulletin text (``REMSYN<len><report>``) it is decoded with
+    :func:`decode`, so the 24 h extremes and precipitation groups are exactly
+    what OGIMET would give. Lines that came in as BUFR (``REMSYN004BUFR``)
+    carry only ISD's own coded groups, and for Chinese stations in 2025 their
+    precipitation and extreme-temperature groups are unusable (24 h totals of
+    0 on rainy days, 12 h maxima that do not move); only the instantaneous
+    temperature and wind of the mandatory section are taken from those.
+
+    ISD stopped updating on AWS in 2025 (succeeded by GHCNh), so this serves
+    backfills and backtests of past seasons.
+    """
+    rows = []
+    for line in text.splitlines():
+        if len(line) < 105 or not line[4:10].isdigit():
+            continue
+        stamp = line[15:27]
+        try:
+            t = dt.datetime.strptime(stamp, "%Y%m%d%H%M")
+        except ValueError:
+            continue
+        rec: dict = {"wmo": line[4:9]}
+        k = line.find("REMSYN")
+        if k >= 0 and "BUFR" not in line[k:k + 16] and line[k + 6:k + 9].isdigit():
+            body = line[k + 9:k + 9 + int(line[k + 6:k + 9])]
+            syn = decode(f"AAXX {t:%d%H}1 {body}")
+            if syn:
+                rec.update(syn)
+        # mandatory section: air temperature (tenths ℃) and wind (tenths m/s), both QC-coded
+        temp, tq = line[87:92], line[92]
+        if "t" not in rec and temp not in ("+9999", "-9999") and tq in "01459":
+            rec["t"] = int(temp) / 10.0
+        wdir, wspd, wq = line[60:63], line[65:69], line[69]
+        if wspd != "9999" and wq in "01459":
+            rec["wind_speed"] = int(wspd) / 10.0
+            rec["wind_dir"] = None if wdir == "999" or rec["wind_speed"] == 0 else float(int(wdir))
+        rec["time"] = t.strftime("%Y-%m-%dT%H:%M")
+        rows.append(rec)
+    return rows
+
+
+ISD = "https://noaa-isd-pds.s3.amazonaws.com/data"
+
+
+def fetch_isd(station: Station, year: int, *, sess=None) -> list[dict]:
+    """One station-year from NOAA ISD on AWS (see :func:`parse_isd`)."""
+    import gzip
+
+    sess = sess or session()
+    blob = get(sess, f"{ISD}/{year}/{station.wmo}0-99999-{year}.gz", timeout=120, retries=3)
+    return parse_isd(gzip.decompress(blob).decode("utf-8", "replace"))
 
 
 # ------------------------------------------------------------------ fetching + store

@@ -39,6 +39,32 @@ def test_negative_temperatures_and_missing_groups():
     assert "wind_speed" not in r and "p6" not in r
 
 
+def test_six_hour_precip_in_section_3():
+    """Some stations send 12 h in section 1 (60002) and the 6 h amount in section 3 (333 ... 6RRR1)."""
+    r = obs.decode("AAXX 13061 58633 04969 /2802 10305 20124 30011 40108 57026 60122 70000 "
+                   "333 10305 20148 3/015 5003/ 54405 58001 60071 70120 90720 91106=")
+    assert r["p6"] == 7.0 and r["p12"] == 12.0 and r["r24"] == 12.0
+    assert r["tx24"] == 30.5 and r["tn24"] == 14.8
+
+
+ISD_SYN = ("0254587300999992025082418004+27767+118033FM-12+022199999V0200301N001019999999N030000199"
+           "+02491+02201101221ADDAA106000091AA212000131KA1120M+03691KA2120N+02391MD1710111+9999"
+           "MW1001OD139900901999REMSYN11858730 04980 /0301 10249 20220 39871 40122 57011 69912 70000 "
+           "333 10369 20239 3/025 5002/ 58013 60001 70001 90720 91109=")
+ISD_BUFR = ("0158587300999992025030112004+27770+118030FM-12+022199999V0200121N0008199999999011400199"
+            "+01851+00031102421ADDAA124000091AA299999999KA1120M+02501KA2120N+01201MW1001REMSYN004BUFR")
+
+
+def test_isd_lines_decode_like_ogimet():
+    syn, bufr = obs.parse_isd(ISD_SYN + "\n" + ISD_BUFR + "\nnot a record\n")
+    assert syn["time"] == "2025-08-24T18:00" and syn["wmo"] == "58730"
+    assert syn["t"] == 24.9 and syn["tx24"] == 36.9 and syn["tn24"] == 23.9
+    assert syn["p6"] == 0.0 and syn["p12"] == 0.1 and syn["wind_speed"] == 1.0
+    # BUFR-relayed lines: only the instantaneous state, never their broken precip/extremes
+    assert bufr["time"] == "2025-03-01T12:00" and bufr["t"] == 18.5 and bufr["wind_speed"] == 0.8
+    assert "p6" not in bufr and "tx24" not in bufr and "r24" not in bufr
+
+
 def test_ogimet_csv_and_store_merge(tmp_path):
     text = f"58730,2026,09,27,06,00,{REP_06Z}\n58730,2026,09,27,12,00,{REP_12Z}\njunk\n"
     rows = obs.parse_ogimet(text)

@@ -33,7 +33,7 @@ import xarray as xr
 
 from ..grid import ForecastGrid
 from ..runs import Run
-from ._fetch import concat_messages, decode_grib, get, head_ok, session
+from ._fetch import decode_grib, get, head_ok, session
 
 #: Mirrors of the same open-data tree. The AWS mirror comes first because
 #: data.ecmwf.int answers ~50 % of a burst with HTTP 429 and no Retry-After,
