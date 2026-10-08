@@ -304,6 +304,16 @@ class ObsStore:
         return dt.datetime.fromisoformat(max(cur)) if cur else None
 
 
+def latest(root, stations: Iterable[Station]) -> dt.datetime | None:
+    """Newest report time held for any of ``stations`` under ``root`` (None when there is none)."""
+    root = pathlib.Path(root)
+    if not root.is_dir():
+        return None
+    store = ObsStore(root)
+    times = [t for t in (store.last_time(s.wmo) for s in stations) if t is not None]
+    return max(times) if times else None
+
+
 def update(store: ObsStore, stations: Iterable[Station], *, days: int = 60, sess=None,
            now: dt.datetime | None = None, pause: float = POLITE_S) -> dict[str, int]:
     """Bring every station up to date (at most ``days`` back); returns new reports per station."""

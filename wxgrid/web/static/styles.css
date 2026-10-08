@@ -206,6 +206,8 @@ html[data-theme="night"] .g-flake{stroke:#cfeaff}
 .a-red{color:var(--a-red)} .a-orange{color:var(--a-orange)}
 .a-yellow{color:var(--a-yellow)} .a-blue{color:var(--a-blue)} .a-note{color:var(--dim)}
 .a-foot{margin:0 2px; font-size:11.5px; color:var(--faint)}
+.ovl{text-decoration:overline}
+.acc-sub{margin:22px 2px 8px; font-size:14px; font-weight:780; color:var(--ink)}
 
 /* ---------- hourly band ---------- */
 .pick{margin-left:auto; display:flex; align-items:center; gap:8px; font-size:13px; color:var(--dim)}

@@ -476,13 +476,18 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
     member_tot = {m: np.full((len(pts), len(plan)), np.nan) for m in runs}
     for k, p in enumerate(plan):
         start, end = _period_bounds(p, init_v)
-        per = {}
+        per, wind = {}, []
         for m, r in runs.items():
-            tt, pp, _ = period_stats(r, vals[m]["std" if p.kind == "day" else "local"], start, end, p.kind)
+            tt, pp, wv = period_stats(r, vals[m]["std" if p.kind == "day" else "local"], start, end, p.kind)
             per[m] = tt if tt is not None else np.full(len(pts), np.nan)
             if pp is not None:
                 member_tot[m][:, k] = pp
+            if wv is not None:
+                wind.append(wv)
         t = consensus.combine_temperature(temp_cal, p.kind, lead_day(end, issue_nominal), per)
+        if p.kind == "night" and wind:
+            with np.errstate(invalid="ignore"):
+                t = t + consensus.night_wind_adjust((cal or {}).get("night_wind"), np.nanmean(np.stack(wind), axis=0))
         ext["tmax" if p.kind == "day" else "tmin"][:, k] = t
 
     # ---- probabilities (detail only): per period from the members, calibrated; per 3 h from GEFS
@@ -511,18 +516,28 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
                 if j1.size and (s0 == 0 or j0.size):
                     amt = accm[:, :, j1[0]] - (accm[:, :, j0[0]] if s0 > 0 else 0.0)
                     gefs_share[:, k] = (amt >= consensus.WET_MM).mean(axis=0)
+    heavy = None
     if want_pop:
         pp = np.full((len(pts), len(plan)), np.nan)
+        hv = {thr: np.full((len(pts), len(plan)), np.nan) for thr in consensus.HEAVY_MM}
+        cal_pop = (cal or {}).get("pop") or {}
         for k, p in enumerate(plan):
-            pp[:, k] = 100.0 * consensus.predict_pop(
-                (cal or {}).get("pop"), p.kind, {m: member_tot[m][:, k] for m in runs},
-                None if gefs_share is None else gefs_share[:, k])
+            totals = {m: member_tot[m][:, k] for m in runs}
+            pp[:, k] = consensus.predict_pop(cal_pop, p.kind, totals, None if gefs_share is None else gefs_share[:, k])
+            for thr, v in consensus.predict_heavy((cal or {}).get("heavy"), cal_pop.get("member_qmap"),
+                                                  p.kind, totals).items():
+                if v is not None:
+                    hv[thr][:, k] = v
+        p5, p15 = consensus.order_probabilities(pp, *hv.values())
+        heavy = {"moderate": 100.0 * p5, "heavy": 100.0 * p15}
+        pp = 100.0 * pp
         if not np.isfinite(pp).any():
             pp = None
 
     prod = product.build(ds, periods=plan, issue_utc=issue, county=county, seat=seat,
                          run=init_v.strftime("%Y%m%d%H"), member="native", sources=tuple(runs), weights=None,
-                         tz=tz, extremes=ext, period_pop=pp, step_pop=sp, pop_members=n_ens)
+                         tz=tz, extremes=ext, period_pop=pp, step_pop=sp, pop_members=n_ens,
+                         period_pop_heavy=heavy)
     meta = prod["meta"]
     meta["engine"] = "native"
     meta["cycle"] = cycle.strftime("%Y%m%d%H")
@@ -534,7 +549,15 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
     if cal:
         meta["weights"] = {kind: {lead: e["w"] for lead, e in by.items()} for kind, by in cal["temp"].items()}
     meta["attribution"] = "ECMWF open data (CC BY 4.0); NOAA GFS/GEFS (public domain)"
+    # what this issue says at the stations, for scoring the forecasts as issued
+    try:
+        consensus.log_issued(cal_root, consensus.issued_rows(runs, stations, cal, issue=issue,
+                                                             run_key=init_v.strftime("%Y%m%d%H")))
+    except Exception as exc:  # noqa: BLE001 — the log is a report, never a reason to fail the forecast
+        print(f"[native] issued log failed: {type(exc).__name__}: {exc}", flush=True)
     prod["verification"] = consensus.load_scores(cal_root)
+    meta["health"] = consensus.health(cal, prod["verification"], members_used=list(runs), members=members,
+                                      now=issue, obs_latest=obs_mod.latest(obs_root, stations))
     prod["text"] = bulletin.render(prod)
     if not hourly:
         return prod, None

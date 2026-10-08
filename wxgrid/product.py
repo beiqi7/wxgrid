@@ -98,7 +98,12 @@ def _windows(precip_row: np.ndarray, steps: np.ndarray, p: periods_mod.Period, i
     return [(a, b) for a, b in spans]
 
 
-def _cell(agg: xr.Dataset, i: int, k: int, p: periods_mod.Period, pop_val, spans) -> dict[str, Any]:
+def _pct(v):
+    return None if v is None or not np.isfinite(v) else round(float(v))
+
+
+def _cell(agg: xr.Dataset, i: int, k: int, p: periods_mod.Period, pop_val, spans,
+          heavy_vals=(None, None)) -> dict[str, Any]:
     g = lambda v: float(agg[v].values[i, k])  # noqa: E731
     wdir = g("wind_dir")
     lo, hi = phenomena.beaufort(g("wind_speed_min")), phenomena.beaufort(g("wind_speed_max"))
@@ -120,7 +125,9 @@ def _cell(agg: xr.Dataset, i: int, k: int, p: periods_mod.Period, pop_val, spans
         "gust": _f(g("gust"), 2),
         "gust_force": phenomena.beaufort(g("gust")) if np.isfinite(g("gust")) else None,
         "windows": [list(s) for s in spans], "windows_text": _span_text(spans),
-        "pop": None if pop_val is None or not np.isfinite(pop_val) else round(float(pop_val)),
+        "pop": _pct(pop_val),
+        # 中雨以上 (>=5 mm) / 大雨以上 (>=15 mm) in the 12 h, %; native engine only
+        "pop_moderate": _pct(heavy_vals[0]), "pop_heavy": _pct(heavy_vals[1]),
     }
 
 
@@ -181,12 +188,14 @@ def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, count
           tz: float, ens=None, ens_run: str | None = None,
           series_hours: int = SERIES_HOURS, extremes: dict[str, np.ndarray] | None = None,
           period_pop: np.ndarray | None = None, step_pop: np.ndarray | None = None,
-          pop_members: int | None = None) -> dict[str, Any]:
+          pop_members: int | None = None, period_pop_heavy: dict[str, np.ndarray] | None = None) -> dict[str, Any]:
     """Assemble the JSON product from a (point, step) township dataset.
 
     ``extremes`` (``{"tmax"|"tmin": (point, period)}``) overrides the period
     extremes aggregated from ``ds`` — the multi-model engine passes the mean of
     each member's own extremes, which is what the verification scores.
+    ``period_pop_heavy`` (``{"moderate"|"heavy": (point, period)}``, %) adds
+    the 中雨以上 / 大雨以上 probabilities to the cells.
     """
     if not periods:
         raise ValueError("no forecast periods — the run does not reach the issue time")
@@ -219,7 +228,9 @@ def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, count
         cells = []
         for i, pid in enumerate(ids):
             pv = pop[pop_ids.index(pid), k] if pop is not None and pid in pop_ids else None
-            cells.append(_cell(agg, i, k, p, pv, _windows(precip[i], steps, p, init_h + off, gap)))
+            hv = tuple(None if (period_pop_heavy or {}).get(key) is None else period_pop_heavy[key][i, k]
+                       for key in ("moderate", "heavy"))
+            cells.append(_cell(agg, i, k, p, pv, _windows(precip[i], steps, p, init_h + off, gap), hv))
         temps = [c["temp"] for c in cells if c["temp"] is not None]
         pr = [c["precip"] for c in cells if c["precip"] is not None]
         rel = periods_mod.relative_label(p.date, issue_date)
@@ -234,6 +245,8 @@ def build(ds: xr.Dataset, *, periods: list[periods_mod.Period], issue_utc, count
                 "force_max": max((c["force_hi"] for c in cells if c["force_hi"] is not None), default=None),
                 "gust_force_max": max((c["gust_force"] for c in cells if c["gust_force"] is not None), default=None),
                 "pop_max": max((c["pop"] for c in cells if c["pop"] is not None), default=None),
+                "pop_moderate_max": max((c["pop_moderate"] for c in cells if c["pop_moderate"] is not None), default=None),
+                "pop_heavy_max": max((c["pop_heavy"] for c in cells if c["pop_heavy"] is not None), default=None),
             },
             "cells": cells,
         })

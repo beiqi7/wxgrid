@@ -15,6 +15,10 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
   members' values are brought to the point's elevation with −6.5 K/km by day
   and with the model's own lapse rate by night, which carries its valley
   inversions (:func:`wxgrid.native.point_values`).
+* **Night wind** — the night minimum also gets ``b · (ln v − mean ln v)``,
+  ``v`` the members' mean night wind: the grids smooth out the radiative
+  cooling of calm nights (autumn 2024: calm nights 0.9 ℃ too warm, windy ones
+  unbiased), fitted on the same window.
 * **Precipitation** — 12 h totals of the member mean, quantile-mapped from the
   forecast to the observed climatology of the window, recent days weighted
   more (14-day half-life).
@@ -23,7 +27,9 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
   stations); direction from the averaged vector.
 * **Probability** — logistic regression of "≥0.1 mm observed" on the
   members' quantile-mapped amounts (detail only); GEFS gives the 3-hourly
-  detail.
+  detail. 中雨以上 (≥5 mm) and 大雨以上 (≥15 mm) per 12 h come from one
+  cumulative logit over the three thresholds (shared slopes), so they stay
+  ordered and the rare 15 mm events borrow the slope from the commoner ones.
 
 Everything scored here is out of sample: :func:`backtest` refits for every
 forecast day on periods that ended before it was issued.
@@ -59,11 +65,25 @@ HALF_LIFE_DAYS: float | None = 20.0
 #: bias 0.64 at day 1 and TS(>=5 mm) 12. 14 days: 0.71 and 18, with spring-summer
 #: 2025 unchanged (PC 82.2 -> 82.5, TS 58.2 -> 58.9).
 PRECIP_HALF_LIFE_DAYS: float | None = 14.0
-RIDGE = 1.0
+#: Ridge toward equal weights, per lead day. Further out the members' skill
+#: differences shrink against the noise of a 60-day fit: 1/1/2/4/8 against a flat 1
+#: cut the day-5 MAE by 0.01–0.04 ℃ in all three backtest seasons, days 1–2 unchanged.
+RIDGE = {1: 1.0, 2: 1.0, 3: 2.0, 4: 4.0, 5: 8.0}
 MIN_ROWS = 30
 LOWLAND_M = 500.0
 WET_MM = verify.WET_MM
 KEYS = ["init", "station", "date", "kind", "lead", "end"]
+#: Night wind (m/s) is clipped to this range before its log enters the night term.
+NIGHT_WIND_MS = (0.3, 8.0)
+#: 12 h thresholds of the extra probabilities: 中雨以上, 大雨以上 (CMA 12 h grades).
+HEAVY_MM = (5.0, 15.0)
+#: The mapped member mean enters the heavy-rain logit capped here: uncapped, a
+#: 30 mm forecast read as near-certain >=15 mm at the station (spring-summer 2025,
+#: separate fits: 0.72 forecast on average above 50 %, 0.42 observed); capped and
+#: cumulative, Brier skill for >=15 mm 0.14 -> 0.25.
+HEAVY_CAP_MM = 10.0
+#: Fewest events in the window to publish each extra probability.
+HEAVY_MIN_EVENTS = {5.0: 20, 15.0: 8}
 
 
 # ------------------------------------------------------------------ training table
@@ -137,7 +157,7 @@ def training_table(archive_root, obs_root, stations=obs_mod.NEAR_YANSHAN, *,
 
 # ------------------------------------------------------------------ temperature
 
-def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE,
+def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float | dict = RIDGE,
                     half_life: float | None = HALF_LIFE_DAYS) -> dict:
     """``{kind: {lead: {"w": {member: weight}, "a": intercept, "n": pairs}}}`` from rows with observations.
 
@@ -163,7 +183,8 @@ def fit_temperature(tab: pd.DataFrame, *, members=MEMBERS, ridge: float = RIDGE,
         s = s / s.mean()
         fm = F.mean(axis=1)
         X = np.column_stack([np.ones(len(y)), (F - fm[:, None])[:, :-1]])
-        R = ridge * len(y) * np.eye(X.shape[1])
+        lam = ridge.get(int(lead), max(ridge.values())) if isinstance(ridge, dict) else ridge
+        R = lam * len(y) * np.eye(X.shape[1])
         R[0, 0] = 0.0
         beta = np.linalg.solve((X * s[:, None]).T @ X + R, (X * s[:, None]).T @ (y - fm))
         w = np.r_[beta[1:], 0.0] + 1.0 / len(cols)
@@ -196,6 +217,58 @@ def combine_temperature(cal_t: dict | None, kind: str, lead: int, values: dict[s
     with np.errstate(invalid="ignore", divide="ignore"):
         out = np.where(den > 1e-9, num / np.where(den > 1e-9, den, 1.0), plain)
     return out + (entry["a"] if entry else 0.0)
+
+
+def _night_wind_x(wind) -> np.ndarray:
+    return np.log(np.clip(np.asarray(wind, dtype=float), *NIGHT_WIND_MS))
+
+
+def fit_night_wind(tab: pd.DataFrame, base: np.ndarray, *, half_life: float | None = HALF_LIFE_DAYS) -> dict | None:
+    """Slope of the night residual (observed − ``base``) on ln(member-mean night wind).
+
+    Pooled over leads and recency-weighted like the temperature fit; centred on
+    the window's mean wind, so it moves calm and windy nights apart without
+    shifting the average (the consensus's own bias stays in charge of that).
+    """
+    night = (tab["kind"] == "night").values
+    wind = tab[[f"{m}_w" for m in MEMBERS]].mean(axis=1).values
+    r = tab["o_t"].values.astype(float) - np.asarray(base, dtype=float)
+    ok = night & np.isfinite(r) & np.isfinite(wind)
+    if ok.sum() < 100:
+        return None
+    g = tab[ok]
+    x, r = _night_wind_x(wind[ok]), r[ok]
+    w = recency_weights(g, half_life)
+    mu, rm = np.average(x, weights=w), np.average(r, weights=w)
+    sxx = np.sum(w * (x - mu) ** 2)
+    if sxx <= 0:
+        return None
+    # 1 % shrinkage: a near-constant wind in the window must not blow the slope up
+    b = float(np.sum(w * (x - mu) * (r - rm)) / (1.01 * sxx))
+    return {"b": round(b, 4), "mu": round(float(mu), 4), "n": int(ok.sum())}
+
+
+def night_wind_adjust(entry: dict | None, wind) -> np.ndarray:
+    """The night term for member-mean wind ``wind`` (m/s); 0 where unknown or unfitted."""
+    wind = np.asarray(wind, dtype=float)
+    if not entry:
+        return np.zeros(wind.shape)
+    with np.errstate(invalid="ignore"):
+        adj = entry["b"] * (_night_wind_x(wind) - entry["mu"])
+    return np.where(np.isfinite(adj), adj, 0.0)
+
+
+def consensus_t(cal: dict | None, tab: pd.DataFrame, *, night_wind: bool = True) -> np.ndarray:
+    """Consensus period temperature for every row of a member table (with the night term)."""
+    out = np.full(len(tab), np.nan)
+    pos = {ix: j for j, ix in enumerate(tab.index)}
+    for (kind, lead), g in tab.groupby(["kind", "lead"]):
+        j = np.array([pos[ix] for ix in g.index])
+        t = combine_temperature((cal or {}).get("temp"), kind, int(lead), {m: g[f"{m}_t"].values for m in MEMBERS})
+        if night_wind and kind == "night":
+            t = t + night_wind_adjust((cal or {}).get("night_wind"), g[[f"{m}_w" for m in MEMBERS]].mean(axis=1).values)
+        out[j] = t
+    return out
 
 
 # ------------------------------------------------------------------ precipitation
@@ -337,6 +410,69 @@ def predict_pop(cal_pop: dict | None, kind: str, member_totals: dict[str, np.nda
     return np.where(np.isfinite(X).all(axis=1), p, np.nan).reshape(shape)
 
 
+def heavy_features(member_totals: dict[str, np.ndarray], cal_pm: dict | None, kind: str) -> np.ndarray:
+    """[ln(1 + mapped member mean, capped at :data:`HEAVY_CAP_MM`), share of members ≥0.1 mm,
+    share ≥5 mm (each after its own quantile map), night flag]."""
+    fits = (cal_pm or {}).get(kind) or {}
+    mapped = np.stack([qmap(np.asarray(v, dtype=float).ravel(), fits.get(m)) for m, v in member_totals.items()])
+    ok = np.isfinite(mapped)
+    with np.errstate(invalid="ignore"):
+        mean = np.nanmean(mapped, axis=0)
+        share = [np.nanmean(np.where(ok, mapped >= thr, np.nan), axis=0) for thr in (WET_MM, HEAVY_MM[0])]
+    return np.column_stack([np.log1p(np.minimum(mean, HEAVY_CAP_MM)), *share,
+                            np.full(mean.shape, float(kind == "night"))])
+
+
+def fit_heavy(tab: pd.DataFrame, cal_pm: dict | None, *, members=MEMBERS, half_life: float | None = None) -> dict:
+    """Cumulative logit ``P(obs ≥ c_j) = σ(a + δ_j + β·x)`` over c = 0.1, 5, 15 mm, both kinds pooled.
+
+    One slope vector for every threshold (fitted on the rows stacked once per
+    threshold, an indicator per threshold above the first): the 15 mm events
+    are few, the slope comes mostly from the commoner ones. Thresholds with
+    fewer than :data:`HEAVY_MIN_EVENTS` events in the window are not published.
+    """
+    g = tab.dropna(subset=["o_p", *[f"{m}_p" for m in members]])
+    if g.empty:
+        return {}
+    X = np.vstack([heavy_features({m: g.loc[g["kind"] == k, f"{m}_p"].values for m in members}, cal_pm, k)
+                   for k in ("day", "night")])
+    g = pd.concat([g[g["kind"] == "day"], g[g["kind"] == "night"]])
+    o = g["o_p"].values.astype(float)
+    events = {thr: int((o >= thr).sum()) for thr in HEAVY_MM}
+    if events[HEAVY_MM[0]] < HEAVY_MIN_EVENTS[HEAVY_MM[0]] or not np.isfinite(X).all():
+        return {"events": {str(k): v for k, v in events.items()}}
+    w = recency_weights(g, half_life if half_life is not None else PRECIP_HALF_LIFE_DAYS)
+    cuts = (WET_MM, *HEAVY_MM)
+    rows, ys = [], []
+    for j, thr in enumerate(cuts):
+        ind = np.zeros((len(o), len(cuts) - 1))
+        if j:
+            ind[:, j - 1] = 1.0
+        rows.append(np.column_stack([X, ind]))
+        ys.append((o >= thr).astype(float))
+    coef = _logit_fit(np.vstack(rows), np.concatenate(ys), sample_weight=np.tile(w, len(cuts)))
+    return {"coef": [round(float(c), 5) for c in coef], "events": {str(k): v for k, v in events.items()},
+            "published": [thr for thr in HEAVY_MM if events[thr] >= HEAVY_MIN_EVENTS[thr]]}
+
+
+def predict_heavy(cal_heavy: dict | None, cal_pm: dict | None, kind: str,
+                  member_totals: dict[str, np.ndarray]) -> dict[float, np.ndarray | None]:
+    """Probability (0–1) of ≥5 and ≥15 mm in the period; None for a threshold not published."""
+    shape = np.shape(next(iter(member_totals.values())))
+    coef = (cal_heavy or {}).get("coef")
+    out: dict[float, np.ndarray | None] = {thr: None for thr in HEAVY_MM}
+    if not coef:
+        return out
+    X = heavy_features(member_totals, cal_pm, kind)
+    base = np.column_stack([np.ones(len(X)), X]) @ np.asarray(coef[:1 + X.shape[1]])
+    for j, thr in enumerate(HEAVY_MM):
+        if thr not in (cal_heavy.get("published") or []):
+            continue
+        p = 1.0 / (1.0 + np.exp(-np.clip(base + coef[1 + X.shape[1] + j], -30, 30)))
+        out[thr] = np.where(np.isfinite(X).all(axis=1), p, np.nan).reshape(shape)
+    return out
+
+
 # ------------------------------------------------------------------ fit / apply
 
 def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int = WINDOW_DAYS) -> dict[str, Any]:
@@ -344,28 +480,51 @@ def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int =
     now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     tr = tab[(tab["end"] <= now) & (tab["end"] > now - dt.timedelta(days=window_days))] if len(tab) else tab
     dates = sorted(tr["date"].unique()) if len(tr) else []
+    temp = fit_temperature(tr)
+    pop = fit_pop(tr) if len(tr) else {}
     return {
         "method": "weighted member consensus (weights >= 0, sum 1, ridge to equal) + bias, per kind and lead; "
-                  "12 h precipitation quantile map; logistic PoP",
+                  "night term on ln(wind); 12 h precipitation quantile map; logistic PoP; "
+                  "cumulative logit for >=5 / >=15 mm",
         "members": list(MEMBERS), "window": [dates[0], dates[-1]] if dates else None,
         "n_pairs": int(tr["o_t"].notna().sum()) if len(tr) else 0,
         "lapse": {"day": "std", "night": "local"},
-        "temp": fit_temperature(tr), "precip": fit_precip(tr) if len(tr) else {}, "pop": fit_pop(tr) if len(tr) else {},
+        "temp": temp,
+        "night_wind": fit_night_wind(tr, consensus_t({"temp": temp}, tr, night_wind=False)) if len(tr) else None,
+        "precip": fit_precip(tr) if len(tr) else {}, "pop": pop,
+        "heavy": fit_heavy(tr, pop.get("member_qmap")) if len(tr) else {},
         "wind": fit_wind(tr) if len(tr) else {},
     }
 
 
 def predict(cal: dict | None, tab: pd.DataFrame) -> pd.DataFrame:
-    """Consensus ``t``, ``p`` and ``pop`` for every row of a member table."""
-    out = pd.DataFrame(index=tab.index, columns=["t", "p", "pop", "w"], dtype=float)
-    for (kind, lead), g in tab.groupby(["kind", "lead"]):
-        out.loc[g.index, "w"] = member_mean_wind(g).values * wind_factor(cal, kind)
-        vals = {m: g[f"{m}_t"].values for m in MEMBERS}
-        out.loc[g.index, "t"] = combine_temperature((cal or {}).get("temp"), kind, int(lead), vals)
-        out.loc[g.index, "p"] = map_precip((cal or {}).get("precip"), kind, member_mean_precip(g).values)
-        out.loc[g.index, "pop"] = predict_pop((cal or {}).get("pop"), kind,
-                                              {m: g[f"{m}_p"].values for m in MEMBERS}, g["gefs_pop"].values)
+    """Consensus ``t``, ``p``, ``pop``, ``p5``/``p15`` (≥5 / ≥15 mm) and ``w`` for every row of a member table."""
+    out = pd.DataFrame(index=tab.index, columns=["t", "p", "pop", "p5", "p15", "w"], dtype=float)
+    out["t"] = consensus_t(cal, tab)
+    cal_pop = (cal or {}).get("pop") or {}
+    for kind, g in tab.groupby("kind"):
+        # averages over the members present, as the live product does with one short
+        # (the backtest scores complete rows only, where this is the plain mean)
+        out.loc[g.index, "w"] = g[[f"{m}_w" for m in MEMBERS]].mean(axis=1).values * wind_factor(cal, kind)
+        out.loc[g.index, "p"] = map_precip((cal or {}).get("precip"), kind,
+                                           g[[f"{m}_p" for m in MEMBERS]].mean(axis=1).values)
+        totals = {m: g[f"{m}_p"].values for m in MEMBERS}
+        out.loc[g.index, "pop"] = predict_pop(cal_pop, kind, totals,
+                                              g["gefs_pop"].values if "gefs_pop" in g else None)
+        heavy = predict_heavy((cal or {}).get("heavy"), cal_pop.get("member_qmap"), kind, totals)
+        for thr, col in zip(HEAVY_MM, ("p5", "p15")):
+            if heavy[thr] is not None:
+                out.loc[g.index, col] = heavy[thr]
+    out["p5"], out["p15"] = order_probabilities(out["pop"].values, out["p5"].values, out["p15"].values)
     return out
+
+
+def order_probabilities(pop, p5, p15):
+    """Keep P(≥15 mm) ≤ P(≥5 mm) ≤ P(≥0.1 mm) where the larger one is known (two separate fits)."""
+    pop, p5, p15 = (np.asarray(a, dtype=float) for a in (pop, p5, p15))
+    p5 = np.where(np.isfinite(pop) & np.isfinite(p5), np.minimum(p5, pop), p5)
+    p15 = np.where(np.isfinite(p5) & np.isfinite(p15), np.minimum(p15, p5), p15)
+    return p5, p15
 
 
 # ------------------------------------------------------------------ backtest / scores
@@ -409,6 +568,56 @@ def _scores(f_t, f_p, rows: pd.DataFrame, f_w=None) -> dict[int, dict]:
     return out
 
 
+def prob_scores(f, o_amount, thr: float, clim: float, mask, lead=None, *,
+                bins=((0.0, 0.2), (0.2, 0.5), (0.5, 0.8), (0.8, 1.01)), min_n: int = 50,
+                min_events: int = 0) -> dict | None:
+    """Brier score, skill against the climatological frequency ``clim`` and reliability of
+    probabilities ``f`` (0–1) for "observed amount ≥ ``thr``"; ``bss_by_lead`` when ``lead`` is given.
+    With fewer than ``min_events`` events the skill is not computed (None): one wet day decides it."""
+    f, o_amount = np.asarray(f, dtype=float), np.asarray(o_amount, dtype=float)
+    ok = np.asarray(mask, dtype=bool) & np.isfinite(f) & np.isfinite(o_amount)
+    if ok.sum() < min_n:
+        return None
+    fo, o = f[ok], (o_amount[ok] >= thr).astype(float)
+    bs, bc = float(((fo - o) ** 2).mean()), float(((clim - o) ** 2).mean())
+    enough = o.sum() >= min_events
+    out = {"n": int(ok.sum()), "events": int(o.sum()), "brier": bs, "brier_climatology": bc,
+           "bss": 1 - bs / bc if bc > 0 and enough else None,
+           "reliability": [{"bin": [a, min(b, 1.0)], "n": int(((fo >= a) & (fo < b)).sum()),
+                            "observed": float(o[(fo >= a) & (fo < b)].mean()) if ((fo >= a) & (fo < b)).any() else None}
+                           for a, b in bins]}
+    if lead is not None and enough:
+        lo = np.asarray(lead)[ok]
+        by = {}
+        for ld in verify.LEADS:
+            s = lo == ld
+            c1 = float(((clim - o[s]) ** 2).mean()) if s.sum() >= 20 and o[s].sum() >= min_events / 2 else 0.0
+            by[str(ld)] = 1 - float(((fo[s] - o[s]) ** 2).mean()) / c1 if c1 > 0 else None
+        out["bss_by_lead"] = by
+    return out
+
+
+#: Night minimum at or below this is a frost night (the product's 霜冻 alert).
+FROST_C = 0.0
+
+
+def frost_scores(f_t, rows: pd.DataFrame) -> dict | None:
+    """Per lead: frost nights observed, hit, missed and falsely forecast (minimum ≤ :data:`FROST_C`)."""
+    f = np.asarray(f_t, dtype=float)
+    o = rows["o_t"].values.astype(float)
+    night = (rows["kind"] == "night").values & np.isfinite(f) & np.isfinite(o)
+    if not (night & (o <= FROST_C)).any() and not (night & (f <= FROST_C)).any():
+        return None
+    out = {}
+    for ld in verify.LEADS:
+        s = night & (rows["lead"].values == ld)
+        ev, fc = o[s] <= FROST_C, f[s] <= FROST_C
+        out[str(ld)] = {"n": int(s.sum()), "events": int(ev.sum()), "hits": int((ev & fc).sum()),
+                        "false_alarms": int((fc & ~ev).sum()),
+                        "bias_on_events": float(np.mean(f[s][ev] - o[s][ev])) if ev.any() else None}
+    return out
+
+
 def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None = None,
              window_days: int = WINDOW_DAYS) -> dict[str, Any]:
     """Out-of-sample scores over the last ``test_days`` of issues, refitting before each one.
@@ -435,7 +644,8 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
         tr_mean = tr.assign(mean=tr[[f"{m}_t_std" for m in MEMBERS]].mean(axis=1, skipna=False))
         b = _ewma_bias(tr_mean, "mean")
         mean_bias = mean_raw - np.array([b.get((k, int(ld)), 0.0) for k, ld in zip(test["kind"], test["lead"])])
-        preds.append(pd.DataFrame({"new_t": p["t"], "new_p": p["p"], "pop": p["pop"], "new_w": p["w"],
+        preds.append(pd.DataFrame({"new_t": p["t"], "new_p": p["p"], "pop": p["pop"], "p5": p["p5"], "p15": p["p15"],
+                                   "new_w": p["w"],
                                    "raw_t": mean_raw, "mb_t": mean_bias, "raw_w": member_mean_wind(test),
                                    "raw_p": member_mean_precip(test)}, index=test.index))
     P = pd.concat(preds)
@@ -464,31 +674,209 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
         "ifs": {"label": "单一 ECMWF IFS", "scores": _scores(t_(rows["ifs_t_std"]), p_(rows["ifs_p"]), rows,
                                                             w_(rows["ifs_w"]))},
     }
-    pop = None
-    ok = np.isfinite(P["pop"].values.astype(float)) & pmask
-    if ok.sum() >= 50:
-        f = P["pop"].values.astype(float)[ok]
-        o = (rows["o_p"].values[ok] >= WET_MM).astype(float)
-        clim = float((tab.loc[tab["end"] < rows["init"].min(), "o_p"].dropna() >= WET_MM).mean())
-        bs, bc = float(((f - o) ** 2).mean()), float(((clim - o) ** 2).mean())
-        bins = [(0.0, 0.2), (0.2, 0.5), (0.5, 0.8), (0.8, 1.01)]
-        pop = {"n": int(ok.sum()), "brier": bs, "brier_climatology": bc, "bss": 1 - bs / bc if bc > 0 else None,
-               "reliability": [{"bin": [a, min(b, 1.0)], "n": int(((f >= a) & (f < b)).sum()),
-                                "observed": float(o[(f >= a) & (f < b)].mean()) if ((f >= a) & (f < b)).any() else None}
-                               for a, b in bins]}
+    before = tab.loc[tab["end"] < rows["init"].min(), "o_p"].dropna()
+    pop = prob_scores(P["pop"].values, rows["o_p"].values, WET_MM, float((before >= WET_MM).mean()),
+                      pmask, rows["lead"].values)
+    heavy = {}
+    for thr, col in zip(HEAVY_MM, ("p5", "p15")):
+        sc = prob_scores(P[col].values, rows["o_p"].values, thr, float((before >= thr).mean()), pmask,
+                         rows["lead"].values, bins=((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.01)), min_events=10)
+        if sc:
+            heavy[f"{thr:g}"] = sc
     first, last = rows["init"].min(), rows["init"].max()
     return {
         "window": [(first + pd.Timedelta(days=1)).date().isoformat(), (last + pd.Timedelta(days=1)).date().isoformat()],
         "days": len(inits), "stations": sorted(rows["station"].unique().tolist()),
         "order": ["new", "mean_bias", "new_raw", "ifs"], "baseline": "ifs",
         "configs": configs, "pop": pop, "pop_label": "3 家模式雨量经逻辑回归校准",
+        "heavy": heavy or None,
+        "frost": frost_scores(t_(P["new_t"]), rows) or None,
         "notes": "白天最高对比 12 时（UTC）报的 24 小时最高气温，夜间最低对比 00 时报的 24 小时最低气温；"
                  "降水为 12 小时（白天 08—20 时、夜间 20—08 时），≥0.1 mm 为有雨，微量按无雨。"
                  "全部样本外：每次预报只用发布前已结束时段的实况拟合。",
     }
 
 
+# ------------------------------------------------------------------ what was actually issued
+
+#: Live scores cover this many days of issues; :data:`HEALTH_LIVE_DAYS` for the health check.
+LIVE_DAYS = 30
+HEALTH_LIVE_DAYS = 14
+
+
+def issued_rows(runs: dict, stations, cal: dict | None, *, issue: dt.datetime, run_key: str) -> list[dict]:
+    """The forecast this issue makes at the lowland stations, as the backtest would score it.
+
+    ``runs`` maps member key to the :class:`~wxgrid.gribbox.BoxRun` used (same
+    cycle). Rows carry the members present, so a forecast made with one short is
+    scored as issued.
+    """
+    low = [s for s in stations if s.elevation_m < LOWLAND_M]
+    if not low or not runs:
+        return []
+    sites = native.sites(obs_mod.as_townships(low))
+    tab = None
+    for m, run in runs.items():
+        f = model_rows(run, sites)
+        f = f.rename(columns={c: f"{m}_{c}" for c in f.columns if c not in KEYS})
+        tab = f if tab is None else tab.merge(f, on=KEYS, how="outer")
+    for m in MEMBERS:
+        for c in ("t", "t_std", "p", "w"):
+            if f"{m}_{c}" not in tab:
+                tab[f"{m}_{c}"] = np.nan
+    tab = tab.reset_index(drop=True)
+    p = predict(cal, tab)
+    out = []
+    for i, r in tab.iterrows():
+        end = dt.datetime.fromisoformat(str(r["end"]))
+        if end <= issue + dt.timedelta(hours=6):
+            continue                     # already (mostly) over when issued
+        rec = {"run": run_key, "issue": issue.isoformat(timespec="minutes"), "init": str(r["init"])[:13],
+               "members": sorted(m for m in runs if np.isfinite(r.get(f"{m}_t", np.nan))),
+               "station": r["station"], "date": r["date"], "kind": r["kind"], "end": end.isoformat(),
+               "lead": native.lead_day(end, issue)}
+        for c in ("t", "p", "pop", "p5", "p15", "w"):
+            v = float(p.at[i, c])
+            rec[c] = round(v, 3) if np.isfinite(v) else None
+        out.append(rec)
+    return out
+
+
+def log_issued(root, rows: list[dict]) -> int:
+    """Append to ``<root>/issued/<YYYYMM>.jsonl`` (by issue month); kept for good, ~6 MB a year."""
+    if not rows:
+        return 0
+    d = pathlib.Path(root) / "issued"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / f"{rows[0]['issue'][:4]}{rows[0]['issue'][5:7]}.jsonl", "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return len(rows)
+
+
+def load_issued(root, *, since: dt.datetime | None = None) -> pd.DataFrame:
+    """Every logged row issued at or after ``since``; a re-issue for the same run replaces the earlier one."""
+    d = pathlib.Path(root) / "issued"
+    rows = []
+    for p in sorted(d.glob("*.jsonl")) if d.is_dir() else []:
+        if since and p.stem < f"{since:%Y%m}":
+            continue
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    if not rows:
+        return pd.DataFrame()
+    f = pd.DataFrame(rows)
+    f["issue"] = pd.to_datetime(f["issue"], format="ISO8601")
+    f["end"] = pd.to_datetime(f["end"], format="ISO8601")
+    if since is not None:
+        f = f[f["issue"] >= pd.Timestamp(since)]
+    return f.drop_duplicates(subset=["run", "station", "date", "kind"], keep="last").reset_index(drop=True)
+
+
+def _block(f: pd.DataFrame) -> dict[int, dict]:
+    out = {}
+    for lead in verify.LEADS:
+        g = f[f["lead"] == lead]
+        day, ngt = g[g["kind"] == "day"], g[g["kind"] == "night"]
+
+        def arr(x, a, b):
+            x = x[[a, b]].astype(float).dropna()
+            return x[a].values, x[b].values
+        fp, op = arr(g, "p", "o_p")
+        out[lead] = {"tmax": verify.temp_scores(*arr(day, "t", "o_t")), "tmin": verify.temp_scores(*arr(ngt, "t", "o_t")),
+                     "rain": verify.rain_scores(fp, op),
+                     "rain5": verify.rain_scores(fp, op, f_thr=verify.MODERATE_12H_MM, o_thr=verify.MODERATE_12H_MM)}
+    return out
+
+
+def live_scores(root, obs_root, stations=obs_mod.NEAR_YANSHAN, *, now: dt.datetime | None = None,
+                days: int = LIVE_DAYS) -> dict[str, Any] | None:
+    """Scores of the forecasts actually issued over the last ``days`` (periods already observed),
+    plus a monthly history of the day-1 scores from the whole log."""
+    now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    f = load_issued(root)
+    if f.empty:
+        return None
+    low = [s for s in stations if s.elevation_m < LOWLAND_M]
+    by_id = {obs_mod.as_townships([s])[0].id: s for s in low}
+    f = f[f["station"].isin(by_id) & (f["end"] <= pd.Timestamp(now))]
+    if f.empty:
+        return None
+    dates = sorted({dt.date.fromisoformat(d) for d in f["date"]})
+    f = f.merge(observed(obs_root, low, dates), on=["station", "date", "kind"], how="left")
+    f["month"] = f["issue"].dt.strftime("%Y-%m")
+    months = {}
+    for mon, g in f.groupby("month"):
+        s = _block(g)[1]
+        months[mon] = {"issues": int(g["run"].nunique()), "tmax_mae": s["tmax"].get("mae"),
+                       "tmin_mae": s["tmin"].get("mae"), "rain_pc": s["rain"].get("pc"),
+                       "tmax_n": s["tmax"].get("n"), "tmin_n": s["tmin"].get("n")}
+    recent = f[f["issue"] > pd.Timestamp(now - dt.timedelta(days=days))]
+    if recent.empty:
+        return {"months": months}
+    pop = prob_scores(recent["pop"].values, recent["o_p"].values, WET_MM,
+                      float((f.loc[f["issue"] <= recent["issue"].min(), "o_p"].dropna() >= WET_MM).mean())
+                      if (f["issue"] <= recent["issue"].min()).any() else 0.5,
+                      np.ones(len(recent), bool), recent["lead"].values, min_n=30)
+    runs = recent.drop_duplicates("run")
+    short = int((runs["members"].map(len) < len(MEMBERS)).sum())
+    return {
+        "window": [recent["issue"].min().date().isoformat(), recent["issue"].max().date().isoformat()],
+        "issues": int(len(runs)), "short_member_issues": short,
+        "scores": _block(recent), "pop": pop,
+        "frost": frost_scores(recent["t"].values, recent) or None,
+        "months": months,
+        "notes": "按每次实际发布的预报（含当时缺成员、订正未更新等情况）在周边国家站位置打分。",
+    }
+
+
+def health(cal: dict | None, scores: dict | None, *, members_used, members=MEMBERS,
+           now: dt.datetime | None = None, obs_latest: dt.datetime | None = None) -> list[str]:
+    """Plain-language warnings for the page when the system is running below its tested state."""
+    now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    out = []
+    missing = [m for m in members if m not in members_used]
+    if missing:
+        from .sources import raw
+        out.append(f"本次未取到 {'、'.join(raw.MODELS[m].label for m in missing)}，按其余 {len(members_used)} 家出预报，误差可能略大。")
+    if not cal:
+        out.append("站点订正未生效（模式存档或实况不足），本次为各家简单平均，气温误差会明显偏大。")
+    elif cal.get("generated"):
+        age = (now - dt.datetime.fromisoformat(cal["generated"]).replace(tzinfo=None)).total_seconds() / 86400
+        if age >= 2:
+            out.append(f"站点订正已 {age:.0f} 天未更新（实况或存档刷新失败），沿用上次的订正。")
+    if obs_latest is not None and (now - obs_latest).total_seconds() > 3 * 86400:
+        out.append(f"周边国家站实况已 {(now - obs_latest).total_seconds() / 86400:.0f} 天未更新。")
+    live = (scores or {}).get("live") or {}
+    bt = (scores or {}).get("configs", {}).get("new", {}).get("scores", {})
+    lv = (live.get("scores") or {})
+    l1, b1 = lv.get(1) or lv.get("1"), bt.get(1) or bt.get("1")
+    if l1 and b1 and live.get("issues", 0) >= 10:
+        def mae(s, k):
+            return (s.get(k) or {}).get("mae")
+        gap = [mae(l1, k) - mae(b1, k) for k in ("tmax", "tmin") if mae(l1, k) is not None and mae(b1, k) is not None]
+        if gap and max(gap) > 0.5:
+            out.append(f"最近 {LIVE_DAYS} 天实际发布的预报比同期回测误差大 {max(gap):.1f} ℃，请检查数据与订正是否正常。")
+    return out
+
+
 # ------------------------------------------------------------------ daily refresh
+
+def finite(obj):
+    """``obj`` with NaN/inf floats (empty score cells) as None: browsers' JSON.parse rejects NaN."""
+    if isinstance(obj, dict):
+        return {(str(k) if not isinstance(k, str) else k): finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [finite(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if np.isfinite(obj) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
 
 def refresh(root=DEFAULT_ROOT, *, archive_root=archive.DEFAULT_ROOT, obs_root=None,
             stations=obs_mod.NEAR_YANSHAN, sess=None, now: dt.datetime | None = None,
@@ -520,9 +908,13 @@ def refresh(root=DEFAULT_ROOT, *, archive_root=archive.DEFAULT_ROOT, obs_root=No
         cal["generated"] = now.isoformat(timespec="seconds")
         scores = backtest(tab, end=pd.Timestamp(now))
         scores["generated"] = cal["generated"]
+        try:
+            scores["live"] = live_scores(root, obs_root, stations, now=now)
+        except Exception as exc:  # noqa: BLE001 — the live log is a report, never a reason to fail
+            print(f"[consensus] live scores failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         for path, obj in ((cal_path, cal), (root / "scores.json", scores)):
             tmp = path.with_suffix(".part")
-            tmp.write_text(json.dumps(obj, ensure_ascii=False, default=float), encoding="utf-8")
+            tmp.write_text(json.dumps(finite(obj), ensure_ascii=False, default=float), encoding="utf-8")
             tmp.replace(path)
         return cal
     except Exception as exc:  # noqa: BLE001 — keep forecasting with the last good calibration

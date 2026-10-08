@@ -175,15 +175,61 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def _score_cells(c: dict) -> str:
+    cells = []
+    for lead in ("1", "3", "5"):
+        s = c["scores"].get(lead) or c["scores"].get(int(lead))
+        cells.append(f"Tx {_f(s['tmax'].get('mae'), 4, 2)}/{_f(s['tmax'].get('acc2'), 3, 0)}% "
+                     f"Tn {_f(s['tmin'].get('mae'), 4, 2)} 晴雨{_f(s['rain'].get('pc'), 3, 0)}%")
+    return "  ".join(cells)
+
+
+def _f(x, width: int, digits: int) -> str:
+    return f"{x:{width}.{digits}f}" if isinstance(x, (int, float)) and x == x else "—".rjust(width)
+
+
+def _print_native_extras(scores: dict) -> None:
+    for thr, h in (scores.get("heavy") or {}).items():
+        by = " ".join(_f(h["bss_by_lead"].get(str(ld)), 5, 2) for ld in range(1, 6)) if h.get("bss_by_lead") else ""
+        print(f">= {thr} mm probability: Brier skill {_f(h.get('bss'), 4, 2)} (days 1-5: {by}), {h['events']} events")
+    frost = scores.get("frost") or {}
+    if frost:
+        print("frost nights (min <= 0 C), observed/hit/false alarm: "
+              + "  ".join(f"day {ld} {f['events']}/{f['hits']}/{f['false_alarms']}" for ld, f in frost.items()))
+    live = scores.get("live") or {}
+    if live.get("scores"):
+        print(f"as issued {live['window'][0]} .. {live['window'][1]} ({live['issues']} issues, "
+              f"{live.get('short_member_issues', 0)} short of a member): "
+              + _score_cells({"scores": live["scores"]}))
+    for mon, m in sorted((live.get("months") or {}).items())[-12:]:
+        print(f"  {mon}: {m['issues']:3d} issues, day 1 Tx {_f(m.get('tmax_mae'), 4, 2)} "
+              f"Tn {_f(m.get('tmin_mae'), 4, 2)} 晴雨 {_f(m.get('rain_pc'), 3, 0)}%")
+
+
 def cmd_verify(args) -> int:
     """Refresh the station archive, refit the calibration, print the scores."""
     import json
     import pathlib
 
-    from . import postproc
+    from . import consensus, postproc
+    data = pathlib.Path(args.data_dir)
+    if args.compare:
+        both = {"multimodel": postproc.load_scores(args.dir), "native": consensus.load_scores(data / "native")}
+        ok = {k: v for k, v in both.items() if v and not v.get("error") and v.get("configs")}
+        if len(ok) < 2:
+            print("need scores from both engines; run `verify` and `verify --engine native` first "
+                  f"(have: {', '.join(ok) or 'none'})")
+            return 1
+        print(f"{'':30s} " + "  ".join(f"{'第' + str(l) + '天':^27s}" for l in (1, 3, 5)))
+        for k, v in ok.items():
+            print(f"{k} {v['window'][0]} .. {v['window'][1]} ({v['days']} days)")
+            print(f"  {v['configs']['new']['label'][:26]:28s} " + _score_cells(v["configs"]["new"]))
+        lv = (ok["native"].get("live") or {})
+        if lv.get("scores"):
+            print(f"native as issued {lv['window'][0]} .. {lv['window'][1]}: " + _score_cells({"scores": lv["scores"]}))
+        print("windows differ by up to a few days; both are scored out of sample on the same stations")
+        return 0
     if args.engine == "native":
-        from . import consensus
-        data = pathlib.Path(args.data_dir)
         cal = consensus.refresh(data / "native", archive_root=data / "archive", obs_root=data / "verify" / "obs",
                                 max_age_days=0 if args.force else 1)
         scores = consensus.load_scores(data / "native")
@@ -199,11 +245,9 @@ def cmd_verify(args) -> int:
     print(f"{'':30s} " + "  ".join(f"{'第' + str(l) + '天':^27s}" for l in (1, 3, 5)))
     for key in scores.get("order") or scores["configs"]:
         c = scores["configs"][key]
-        cells = []
-        for lead in ("1", "3", "5"):
-            s = c["scores"].get(lead) or c["scores"].get(int(lead))
-            cells.append(f"Tx {s['tmax']['mae']:4.2f}/{s['tmax']['acc2']:3.0f}% Tn {s['tmin']['mae']:4.2f} 晴雨{s['rain']['pc']:3.0f}%")
-        print(f"{c['label'][:28]:30s} " + "  ".join(cells))
+        print(f"{c['label'][:28]:30s} " + _score_cells(c))
+    if args.engine == "native":
+        _print_native_extras(scores)
     if args.json:
         print(json.dumps(scores, ensure_ascii=False, indent=1, default=float))
     return 0
@@ -319,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--json", action="store_true")
     v.add_argument("--engine", choices=("multimodel", "native"), default="multimodel")
     v.add_argument("--data-dir", default="/var/lib/wxgrid", help="native engine: archive/, native/, verify/obs/ under it")
+    v.add_argument("--compare", action="store_true",
+                   help="print the stored scores of both engines side by side (run each refresh first)")
     v.set_defaults(func=cmd_verify)
 
     bf = sub.add_parser("backfill", help="seed the native engine's run archive from historical open data")
