@@ -374,7 +374,7 @@ def test_publish_multimodel_skips_the_same_issue_window(tmp_path, monkeypatch):
     kw = dict(townships=str(csv), county="测试县", seat="甲镇", data_dir=str(tmp_path / "d"), issue_utc=issue)
     out = publish.publish_once(**kw)
     assert out.name == "测试县_2026092809.json" and calls[0]["engine"] == "multimodel"
-    assert str(calls[0]["verify_root"]).endswith("/d/verify")
+    assert pathlib.Path(calls[0]["verify_root"]) == tmp_path / "d" / "verify"
     publish.publish_once(**kw)
     assert len(calls) == 1
 
@@ -396,7 +396,7 @@ def test_publish_native_names_runs_by_issue_window_and_passes_the_data_dir(tmp_p
               issue_utc=dt.datetime(2026, 9, 27, 23, 30), engine="native")
     out = publish.publish_once(**kw)
     assert out.name == "测试县_2026092721.json"
-    assert calls[0]["engine"] == "native" and str(calls[0]["data_dir"]).endswith("/d")
+    assert calls[0]["engine"] == "native" and pathlib.Path(calls[0]["data_dir"]) == tmp_path / "d"
     publish.publish_once(**kw)
     assert len(calls) == 1, "same issue window, same first period: nothing to recompute"
 

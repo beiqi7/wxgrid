@@ -13,7 +13,8 @@ Environment=PYTHONUNBUFFERED=1
 # Bound to 0.0.0.0 on request. The API is READ-ONLY and unauthenticated: anyone
 # who can reach this port can read every published forecast. There is nothing
 # to write and no secrets in the data dir, but put it behind the reverse proxy
-# (TLS + rate limit) before advertising the URL.
+# (TLS + rate limit) before advertising the URL; deploy/nginx-wxgrid.conf is a
+# template. Behind it, change --host to 127.0.0.1 so only nginx can reach the port.
 ExecStart=/usr/bin/python3 -m wxgrid serve --host 0.0.0.0 --port 8790 --data-dir /var/lib/wxgrid
 Restart=on-failure
 RestartSec=5s

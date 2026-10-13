@@ -123,10 +123,10 @@ def test_netcdf_round_trip_keeps_valid_time(members):
     with tempfile.TemporaryDirectory() as tmp:
         path = f"{tmp}/fc.nc"
         store.write_netcdf({"ecmwf-ifs-0p25": e, "gfs-0p25": g, "blend": b}, path)
-        rt = xr.open_dataset(path)
-        assert "valid_time" in rt.coords
-        frame = store.to_frame(rt.sel(member="blend"), "blend")
-        assert "valid_time" in frame.columns and not frame["valid_time"].isna().any()
+        with xr.open_dataset(path) as rt:  # closed before the temp dir goes (Windows locks open files)
+            assert "valid_time" in rt.coords
+            frame = store.to_frame(rt.sel(member="blend"), "blend")
+            assert "valid_time" in frame.columns and not frame["valid_time"].isna().any()
 
 
 # --- bug 6: GFS snowfall is rebased onto the f000 snowpack ----------------

@@ -238,6 +238,106 @@ def test_unknown_route_is_404(server):
     assert _status(f"{base}/api/nope") == 404
 
 
+# ---------------------------------------------------------------- health, gzip, cache
+
+def _health(base: str):
+    try:
+        with urllib.request.urlopen(f"{base}/api/health", timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _write_latest(data: pathlib.Path, generated: str) -> None:
+    """Swap in a new latest.json the way publish does (write aside, then os.replace)."""
+    import os
+    doc = _product()
+    doc["meta"]["generated"] = generated
+    part = data / "latest.json.part"
+    part.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    os.replace(part, data / "latest.json")
+
+
+def test_health_is_ok_for_a_fresh_product_and_503_once_stale(server, tmp_path):
+    base, _ = server
+    now = dt.datetime.now(dt.timezone.utc)
+    _write_latest(tmp_path, (now - dt.timedelta(hours=1)).isoformat(timespec="seconds"))
+    code, h = _health(base)
+    assert code == 200 and h["status"] == "ok" and 0.9 < h["age_hours"] < 1.1
+    assert h["latest"] == "2026091512" and h["stale_after_hours"] == webapp.STALE_HOURS
+
+    # publish kept failing: the product on disk is more than a day old
+    _write_latest(tmp_path, (now - dt.timedelta(hours=26)).isoformat(timespec="seconds"))
+    code, h = _health(base)
+    assert code == 503 and h["status"] == "stale" and h["age_hours"] > 25
+
+
+def test_health_is_degraded_but_200_when_a_backup_engine_made_the_product(server, tmp_path):
+    import os
+    base, _ = server
+    doc = _product()
+    doc["meta"]["generated"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    doc["meta"]["engine"] = "multimodel"
+    doc["meta"]["fallback"] = {"primary": "native", "used": "multimodel",
+                               "reasons": [{"engine": "native", "reason": "unavailable"}]}
+    part = tmp_path / "latest.json.part"
+    part.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    os.replace(part, tmp_path / "latest.json")
+    code, h = _health(base)
+    assert code == 200 and h["status"] == "degraded" and h["fallback"]["primary"] == "native"
+
+
+def test_health_is_503_before_anything_is_published(tmp_path):
+    srv = webapp.build_server("127.0.0.1", 0, str(tmp_path))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        code, h = _health(f"http://127.0.0.1:{srv.server_address[1]}")
+        assert code == 503 and h["status"] == "empty" and h["runs"] == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_json_and_static_are_gzipped_when_the_client_accepts_it(server):
+    import gzip
+    base, _ = server
+    plain = _get(f"{base}/api/latest")
+    req = urllib.request.Request(f"{base}/api/latest", headers={"Accept-Encoding": "gzip, deflate"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.headers["Content-Encoding"] == "gzip" and "Accept-Encoding" in r.headers["Vary"]
+        zipped = r.read()
+    assert len(zipped) < len(plain[1]) and json.loads(gzip.decompress(zipped)) == json.loads(plain[1])
+    assert "Content-Encoding" not in plain[2], "no Accept-Encoding: send it plain"
+
+    req = urllib.request.Request(f"{base}/static/app.js", headers={"Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.headers["Content-Encoding"] == "gzip" and r.headers["ETag"].endswith('-gz"')
+        assert gzip.decompress(r.read()) == _get(f"{base}/static/app.js")[1]
+
+
+def test_accept_encoding_parsing():
+    assert webapp._accepts_gzip("gzip, deflate, br")
+    assert webapp._accepts_gzip("br;q=1.0, gzip;q=0.8")
+    assert webapp._accepts_gzip("*")
+    assert not webapp._accepts_gzip("gzip;q=0")
+    assert not webapp._accepts_gzip("identity")
+    assert not webapp._accepts_gzip(None)
+
+
+def test_cached_product_is_replaced_when_publish_swaps_the_file(server, tmp_path):
+    """The parse cache must never serve the previous product after an atomic replace."""
+    import os
+    base, _ = server
+    assert json.loads(_get(f"{base}/api/latest")[1])["meta"]["run"] == "2026091512"
+    doc = _product()
+    doc["meta"]["run"] = "2026091600"
+    doc["meta"]["note"] = "a later issue"  # different size too, whatever the clock resolution
+    part = tmp_path / "latest.json.part"
+    part.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    os.replace(part, tmp_path / "latest.json")
+    assert json.loads(_get(f"{base}/api/latest")[1])["meta"]["run"] == "2026091600"
+
+
 def test_every_id_the_ui_script_uses_exists_in_the_page():
     """Regression: app.js and index.html drifted apart during the UI rewrite and
     the page rendered blank because getElementById returned null."""

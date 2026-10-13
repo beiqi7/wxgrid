@@ -339,13 +339,23 @@ def _period_bounds(p, init_v: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
     return init_v + dt.timedelta(hours=p.start_lead), init_v + dt.timedelta(hours=p.end_lead)
 
 
+class NotCalibrated(RuntimeError):
+    """No station calibration is in force (archive not seeded yet, or observations missing too long)."""
+
+
 def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, want_pop: bool = True,
             workers: int = 8, issue_utc=None, sess=None, hourly: bool = False, calibrate: bool = True,
-            data_dir=None, stations=None, members=MEMBERS):
+            data_dir=None, stations=None, members=MEMBERS, require_calibration: bool = False):
     """The product (and optionally the hourly series) from raw IFS + AIFS + GFS (+ GEFS).
 
     Every member run is archived for the calibration; the consensus and its
     corrections are in :mod:`wxgrid.consensus`.
+
+    ``require_calibration`` raises :class:`NotCalibrated` instead of publishing a
+    plain member mean when no calibration is in force. The member runs are
+    archived before that, so the training set keeps growing while a fallback
+    engine covers the issue; once enough pairs exist the next refresh fits and
+    this engine takes over by itself.
     """
     import pathlib
 
@@ -405,6 +415,8 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
     archive.prune(arch_root)
     cal = consensus.refresh(cal_root, archive_root=arch_root, obs_root=obs_root, stations=stations,
                             sess=sess) if calibrate else None
+    if require_calibration and not cal:
+        raise NotCalibrated("no native calibration in force (run `backfill`, or wait for the archive to fill)")
 
     pts = sites(points)
     names = [p.name for p in points]

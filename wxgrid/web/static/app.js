@@ -24,6 +24,7 @@ const S = {
   names: null,     // id -> name
   back: null,      // element to refocus when the sheet closes
   town3h: null,    // township shown in the 3-hourly band
+  painted: null,   // paintKey() of what is on screen (auto-refresh repaints when it changes)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -304,10 +305,24 @@ function renderAlerts() {
     '<p class="a-foot">据模式预报推算，仅作提示；以当地气象台发布的预警信号为准。</p>';
 }
 
-/** System warnings (native engine): a member missing, the calibration stale, the live scores off. */
+/** Same threshold as the server's /api/health (WXGRID_STALE_HOURS, default 14 h). */
+const STALE_HOURS = 14;
+/** A warning when the newest product is overdue (publishing has been failing). */
+function staleNote() {
+  if (S.file && S.runs[0] && S.file !== S.runs[0].file) return null;  // a past run picked on purpose
+  const t = Date.parse(S.doc.meta.generated || '');
+  if (Number.isNaN(t)) return null;
+  const h = (Date.now() - t) / 3600e3;
+  if (h <= STALE_HOURS) return null;
+  return `预报已 ${h >= 48 ? `${Math.floor(h / 24)} 天` : `${Math.round(h)} 小时`}未更新（生成于 ${bjTime(S.doc.meta.generated)} 北京时），` +
+    '定时发布可能出了问题，请以最新官方预报为准。';
+}
+
+/** System warnings: the product overdue, a backup engine used, a member missing, the calibration stale, the live scores off. */
 function renderHealth() {
   const box = $('health');
-  const list = S.doc.meta.health || [];
+  const stale = staleNote();
+  const list = (stale ? [stale] : []).concat(S.doc.meta.health || []);
   box.hidden = !list.length;
   box.innerHTML = list.map(t => `
     <div class="alert a-note"><span class="a-type">运行</span><span class="a-what">${esc(t)}</span></div>`).join('');
@@ -922,6 +937,7 @@ async function pickRun(file) {
     if (!doc.periods) throw new Error('这一时次是旧格式产品（没有白天/夜间分段），无法显示');
     S.doc = doc; S.file = file; S.names = null; S.date = null;
     paint();
+    S.painted = paintKey();
   } catch (err) {
     fail(err.message);
   }
@@ -1000,6 +1016,39 @@ async function boot() {
   const top = S.runs[0];
   S.file = top && top.run === S.doc.meta.run ? top.file : null;
   paint();
+  S.painted = paintKey();
+  setInterval(refresh, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+}
+
+/* ---------- staying current on a page left open (wall display, pinned tab) ---------- */
+const REFRESH_MS = 10 * 60e3;
+/** Changes when what is on screen should change: another run, a period ending, a new 3-hour window, going stale. */
+function paintKey() {
+  const live = livePeriods();
+  return [S.file, live[0] && live[0].end_local, Math.floor(Date.now() / 3 / 3600e3), Boolean(staleNote())].join('|');
+}
+let refreshing = false;
+async function refresh() {
+  if (refreshing || document.hidden || !S.doc || !$('sheet').hidden) return;  // never under an open detail sheet
+  refreshing = true;
+  try {
+    const runs = await api('/api/runs');
+    const top = runs[0];
+    // Follow the newest issue unless the reader picked an older run on purpose.
+    const following = !S.file || !S.runs[0] || S.file === S.runs[0].file;
+    S.runs = runs;
+    if (following && top && top.file !== S.file) {
+      const doc = await api(`/api/runs/${encodeURIComponent(top.file)}`);  // new name = never a cached copy
+      if (doc.periods) { S.doc = doc; S.file = top.file; S.names = null; }
+    }
+    const key = paintKey();
+    if (key !== S.painted) { paint(); S.painted = key; }
+  } catch {
+    // offline or the server restarting: keep what is on screen, try again next tick
+  } finally {
+    refreshing = false;
+  }
 }
 
 boot();

@@ -3,7 +3,8 @@
 Routes::
 
     GET /                     the web UI (static/index.html)
-    GET /api/health           {"status","runs","latest"}
+    GET /api/health           {"status","runs","latest","generated","age_hours",...}; 503 when stale/empty,
+                              200 "degraded" when a fallback engine made the newest product
     GET /api/latest           newest product (full JSON)
     GET /api/summary          newest product's meta + conclusions only (small)
     GET /api/runs             index of stored runs, newest first
@@ -16,10 +17,15 @@ Routes::
     GET /api/hourly/<id|name> one township's hourly rows; ?run=<file> ?hours=N
 
 Everything is served from ``--data-dir``; the server does no computation.
+Parsed JSON files are cached in memory until their mtime/size change, and
+responses are gzip-compressed for clients that accept it.
 """
 from __future__ import annotations
 
 import argparse
+import collections
+import datetime as dt
+import gzip
 import hashlib
 import http.server
 import json
@@ -27,11 +33,85 @@ import os
 import pathlib
 import socketserver
 import sys
+import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
 DEFAULT_DATA_DIR = os.environ.get("WXGRID_DATA_DIR", "/var/lib/wxgrid")
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
+#: ``/api/health`` answers 503 once the newest product is older than this. Publishing
+#: runs at 07:30 and 19:30 (+ <=10 min jitter, a few minutes of compute), so a healthy
+#: gap is ~12.5 h; one missed issue pushes it past 14 h.
+STALE_HOURS = float(os.environ.get("WXGRID_STALE_HOURS", "14"))
+#: Bodies smaller than this are sent as-is (gzip framing would not pay off).
+GZIP_MIN_BYTES = 1024
+#: Parsed JSON files kept in memory. A product is ~0.1-0.5 MB on disk, a few MB parsed;
+#: the web unit's MemoryMax is 384 MB.
+_CACHE_MAX = 12
+_cache: "collections.OrderedDict[str, tuple[tuple[int, int, int], Any]]" = collections.OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _load_json(path: pathlib.Path) -> Any | None:
+    """Parsed JSON at ``path``, re-read only when its mtime or size changed.
+
+    Publishing replaces files atomically (``os.replace``), so a new product shows
+    up as a new mtime/size and is picked up on the next request. Callers must not
+    mutate the returned object; it is shared between requests.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    # os.replace gives the new file a new inode, so that alone catches a swap even
+    # within one mtime tick; mtime/size catch in-place rewrites.
+    key, sig = str(path), (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None and hit[0] == sig:
+            _cache.move_to_end(key)
+            return hit[1]
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    with _cache_lock:
+        _cache[key] = (sig, obj)
+        _cache.move_to_end(key)
+        while len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
+    return obj
+
+
+def _accepts_gzip(header: str | None) -> bool:
+    """True when an ``Accept-Encoding`` header allows gzip (``q=0`` refuses it)."""
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip().lower() in ("gzip", "*"):
+            q = params.strip()
+            if q.startswith("q="):
+                try:
+                    return float(q[2:]) > 0
+                except ValueError:
+                    return False
+            return True
+    return False
+
+
+def _age_hours(generated: str | None, fallback_mtime: float | None) -> float | None:
+    """Hours since ``generated`` (ISO 8601, naive = UTC), else since ``fallback_mtime``."""
+    if generated:
+        try:
+            t = dt.datetime.fromisoformat(generated)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=dt.timezone.utc)
+            return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 3600
+        except ValueError:
+            pass
+    if fallback_mtime is not None:
+        return (time.time() - fallback_mtime) / 3600
+    return None
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -39,32 +119,40 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = "wxgrid/0.1"
 
     # -- helpers ----------------------------------------------------------
-    def _send(self, code: int, body: bytes, ctype: str, *, cache: int = 0) -> None:
+    def _write(self, code: int, body: bytes, headers: dict[str, str]) -> None:
+        """Send ``body`` gzip-compressed when the client accepts it and it is worth it."""
+        gz = len(body) >= GZIP_MIN_BYTES and _accepts_gzip(self.headers.get("Accept-Encoding"))
+        if gz:
+            body = gzip.compress(body, compresslevel=6)
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")  # read-only public data
-        if cache:
-            self.send_header("Cache-Control", f"public, max-age={cache}")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send(self, code: int, body: bytes, ctype: str, *, cache: int = 0) -> None:
+        headers = {"Content-Type": ctype,
+                   "Access-Control-Allow-Origin": "*"}  # read-only public data
+        if cache:
+            headers["Cache-Control"] = f"public, max-age={cache}"
+        else:
+            headers["Cache-Control"] = "no-store"
+        self._write(code, body, headers)
+
     def _json(self, obj: Any, code: int = 200, *, cache: int = 0) -> None:
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+        self._send(code, json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
                    "application/json; charset=utf-8", cache=cache)
 
     def _error(self, code: int, msg: str) -> None:
         self._json({"error": msg}, code=code)
 
     def _read_json(self, name: str) -> Any | None:
-        path = self.data_dir / name
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return None
+        return _load_json(self.data_dir / name)
 
     # -- routing ----------------------------------------------------------
     def do_HEAD(self) -> None:  # noqa: N802
@@ -110,11 +198,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     # -- endpoints --------------------------------------------------------
     def _health(self) -> None:
+        """Liveness *and* freshness: 503 when nothing is published or the newest product is stale.
+
+        A monitor (uptime probe, load balancer) watching this catches a publish
+        job that keeps failing, which a plain "the process is up" check would not.
+        """
         idx = self._read_json("index.json") or []
-        latest = self._read_json("latest.json") or {}
-        self._json({"status": "ok", "runs": len(idx),
-                    "latest": (latest.get("meta") or {}).get("run"),
-                    "hourly": bool(idx and idx[0].get("hourly"))})
+        latest = self._read_json("latest.json")
+        meta = (latest or {}).get("meta") or {}
+        try:
+            mtime = (self.data_dir / "latest.json").stat().st_mtime if latest is not None else None
+        except OSError:
+            mtime = None
+        age = _age_hours(meta.get("generated"), mtime)
+        if latest is None:
+            status = "empty"
+        elif age is not None and age > STALE_HOURS:
+            status = "stale"
+        elif meta.get("fallback"):
+            status = "degraded"  # fresh, but a backup engine made it: still 200, alert on the keyword
+        else:
+            status = "ok"
+        self._json({"status": status, "runs": len(idx), "latest": meta.get("run"),
+                    "engine": meta.get("engine"), "fallback": meta.get("fallback"),
+                    "generated": meta.get("generated"),
+                    "issue_local": meta.get("issue_local"),
+                    "age_hours": None if age is None else round(age, 2), "stale_after_hours": STALE_HOURS,
+                    "health": meta.get("health") or [],
+                    "hourly": bool(idx and idx[0].get("hourly"))},
+                   code=200 if status in ("ok", "degraded") else 503)
 
     def _latest(self) -> None:
         obj = self._read_json("latest.json")
@@ -243,21 +355,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = target.read_bytes()
         # Content ETag + must-revalidate: a redeploy takes effect on the next
         # request instead of serving a stale bundle for the rest of a max-age.
-        etag = '"%s"' % hashlib.sha1(body).hexdigest()[:16]
+        # The gzip variant gets its own tag (same content, different bytes).
+        gz = len(body) >= GZIP_MIN_BYTES and _accepts_gzip(self.headers.get("Accept-Encoding"))
+        etag = '"%s%s"' % (hashlib.sha1(body).hexdigest()[:16], "-gz" if gz else "")
         if self.headers.get("If-None-Match") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("Vary", "Accept-Encoding")
             self.end_headers()
             return
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("ETag", etag)
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        self._write(200, body, {"Content-Type": ctype, "ETag": etag, "Cache-Control": "no-cache"})
 
     def log_message(self, fmt: str, *args) -> None:  # quieter default logging
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))

@@ -319,6 +319,92 @@ def test_issued_log_is_scored_as_issued(tmp_path, monkeypatch):
     assert obs_mod.latest(tmp_path / "verify" / "obs", [st]) == dt.datetime(2026, 10, 13, 21)
 
 
+def _fake_members(monkeypatch):
+    from wxgrid.sources import raw
+
+    def fake_fetch(model, init, steps, box, **kw):
+        lat = np.arange(box.lat_max, box.lat_min - 0.01, -0.25)
+        lon = np.arange(box.lon_min, box.lon_max + 0.01, 0.25)
+        return _run(model.key, init, steps, lat, lon, cadence=model.cadence)
+    monkeypatch.setattr(raw, "probe", lambda *a, **k: True)
+    monkeypatch.setattr(raw, "fetch", fake_fetch)
+
+
+def test_uncalibrated_native_refuses_but_still_archives(tmp_path, monkeypatch):
+    """Not seeded yet: no member-mean product, but this issue's runs join the training set."""
+    _fake_members(monkeypatch)
+    monkeypatch.setattr(consensus, "refresh", lambda *a, **k: None)
+    with pytest.raises(native.NotCalibrated):
+        native.compute(PTS, county="测试县", seat="甲镇", issue_utc=dt.datetime(2026, 10, 7, 23, 30),
+                       want_pop=False, data_dir=tmp_path, stations=[], require_calibration=True)
+    for src in ("ifs", "aifs", "gfs"):
+        assert archive.inits(tmp_path / "archive", src) == [dt.datetime(2026, 10, 7, 12)]
+    assert not (tmp_path / "native" / "issued").exists(), "a product that was not issued is not logged"
+
+
+def _fake_multimodel(calls):
+    def fake(points, **kw):
+        calls.append("multimodel")
+        meta = {"engine": "multimodel", "run": "2026100721", "health": None}
+        return {"meta": meta, "periods": []}, None
+    return fake
+
+
+def test_bundle_falls_back_to_multimodel_and_says_so(tmp_path, monkeypatch):
+    from wxgrid import product
+    calls = []
+    _fake_members(monkeypatch)
+    monkeypatch.setattr(consensus, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(product, "compute_multimodel", _fake_multimodel(calls))
+    prod, _ = product.compute_bundle(PTS, county="测试县", seat="甲镇", engine="native", want_pop=False,
+                                     issue_utc=dt.datetime(2026, 10, 7, 23, 30), sess=object(), data_dir=tmp_path)
+    assert calls == ["multimodel"]
+    fb = prod["meta"]["fallback"]
+    assert fb == {"primary": "native", "used": "multimodel",
+                  "reasons": [{"engine": "native", "reason": "not_calibrated"}]}
+    assert "订正尚未就绪" in prod["meta"]["health"][0] and "Open-Meteo" in prod["meta"]["health"][0]
+
+    # data unreachable on every mirror: same fallback, the other reason
+    def broken(*a, **k):
+        raise RuntimeError("no gfs mirror served x")
+    monkeypatch.setattr(native, "compute", broken)
+    prod, _ = product.compute_bundle(PTS, county="测试县", seat="甲镇", engine="native",
+                                     issue_utc=dt.datetime(2026, 10, 7, 23, 30), sess=object(), data_dir=tmp_path)
+    assert prod["meta"]["fallback"]["reasons"] == [{"engine": "native", "reason": "unavailable"}]
+    assert "mirror" not in prod["meta"]["health"][0], "internals stay in the log, not on the page"
+
+
+def test_bundle_tries_grib_when_native_and_multimodel_both_fail(tmp_path, monkeypatch):
+    from wxgrid import product
+
+    class GribReached(Exception):
+        pass
+
+    def broken(*a, **k):
+        raise RuntimeError("down")
+
+    def choose_run(*a, **k):
+        raise GribReached
+    monkeypatch.setattr(native, "compute", broken)
+    monkeypatch.setattr(product, "compute_multimodel", broken)
+    monkeypatch.setattr(product, "choose_run", choose_run)
+    with pytest.raises(GribReached):
+        product.compute_bundle(PTS, county="测试县", seat="甲镇", engine="native",
+                               issue_utc=dt.datetime(2026, 10, 7, 23, 30), sess=object(), data_dir=tmp_path)
+
+
+def test_mark_fallback_lists_every_engine_tried():
+    from wxgrid import product
+    prod = {"meta": {"engine": "grib", "health": ["本次未取到 X"]}}
+    product._mark_fallback(prod, [("native", "unavailable"), ("multimodel", "unavailable")])
+    assert prod["meta"]["fallback"]["primary"] == "native" and prod["meta"]["fallback"]["used"] == "grib"
+    first = prod["meta"]["health"][0]
+    assert "自主引擎" in first and "Open-Meteo" in first and "未做站点订正" in first
+    assert prod["meta"]["health"][1] == "本次未取到 X"
+    untouched = {"meta": {"engine": "native"}}
+    assert product._mark_fallback(untouched, []) == {"meta": {"engine": "native"}}
+
+
 def test_health_flags_stale_calibration_and_live_drift():
     now = dt.datetime(2026, 10, 8)
     cal = {"generated": "2026-10-04T00:00:00"}

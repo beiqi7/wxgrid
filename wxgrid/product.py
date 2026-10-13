@@ -572,6 +572,32 @@ def compute_multimodel(points: list[Township], *, county: str, seat: str, days: 
     return prod, hdoc
 
 
+#: Page wording for why the primary engine did not publish (reason codes from compute_bundle;
+#: the exception itself only goes to the log, it can carry URLs and internals).
+_FALLBACK_WHY = {
+    ("native", "not_calibrated"): "自主引擎的站点订正尚未就绪（模式存档或实况不足）",
+    ("native", "unavailable"): "自主引擎本次未取到足够的模式数据",
+    ("multimodel", "unavailable"): "多模式数据（Open-Meteo）本次不可用",
+}
+_FALLBACK_USED = {
+    "multimodel": "改用 Open-Meteo 多模式数据出预报（备用）",
+    "grib": "改用 ECMWF IFS + NOAA GFS 原始数据出预报（备用，未做站点订正，误差偏大）",
+}
+
+
+def _mark_fallback(prod: dict[str, Any], tried: list[tuple[str, str]]) -> dict[str, Any]:
+    """Record in the product that it came from a fallback engine, and say so on the page."""
+    if not tried:
+        return prod
+    meta = prod["meta"]
+    meta["fallback"] = {"primary": tried[0][0], "used": meta.get("engine"),
+                        "reasons": [{"engine": e, "reason": r} for e, r in tried]}
+    why = "；".join(_FALLBACK_WHY.get(t, f"{t[0]} 不可用") for t in tried)
+    note = f"{why}，{_FALLBACK_USED.get(meta.get('engine'), '改用备用数据出预报')}。"
+    meta["health"] = [note, *(meta.get("health") or [])]
+    return prod
+
+
 def compute_bundle(points: list[Township], *, county: str, seat: str, days: int = 5, every: int = 3,
                    sources: tuple[str, ...] = ("ecmwf", "gfs"), member: str = "blend",
                    weights: dict[str, float] | None = None, tz: float = daily_mod.TZ_CHINA,
@@ -586,34 +612,48 @@ def compute_bundle(points: list[Township], *, county: str, seat: str, days: int 
     open GRIB archives, downscaled here — when Open-Meteo cannot be reached.
     ``engine="native"`` reads ECMWF IFS + AIFS and NOAA GFS + GEFS from the
     producers' open data and combines them with the station-trained consensus
-    of :mod:`wxgrid.consensus` (no third-party service; see :mod:`wxgrid.native`);
-    it too falls back to ``"grib"``. ``data_dir`` holds its run archive and
-    calibration (default ``/var/lib/wxgrid``).
+    of :mod:`wxgrid.consensus` (no third-party service; see :mod:`wxgrid.native`).
+    When it cannot publish — data unreachable on every mirror, or no calibration
+    in force yet — it falls back to ``"multimodel"``, then ``"grib"``; a fallback
+    product carries ``meta.fallback`` and a line in ``meta.health``. ``data_dir``
+    holds its run archive and calibration (default ``/var/lib/wxgrid``).
     ``run`` pins a GRIB cycle and implies the GRIB engine. ``issue_utc`` (naive
     UTC, default now) decides the first period.
     """
     if engine not in ENGINES:
         raise ValueError(f"engine must be one of {ENGINES}")
+    import sys
     sess = sess or pipeline.session()
     issue_utc = issue_utc or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    tried: list[tuple[str, str]] = []  # (engine, reason code) of engines that did not publish
     if engine == "native" and run is None:
         from . import native
         try:
             return native.compute(points, county=county, seat=seat, days=days, tz=tz, want_pop=want_pop,
                                   workers=max(workers, 8), issue_utc=issue_utc, sess=sess, hourly=hourly,
-                                  calibrate=calibrate, data_dir=data_dir)
+                                  calibrate=calibrate, data_dir=data_dir,
+                                  # an uncalibrated member mean is worse than the 8-model fallback
+                                  require_calibration=calibrate)
+        except native.NotCalibrated as exc:
+            tried.append(("native", "not_calibrated"))
+            print(f"[product] native engine not calibrated yet ({exc}); falling back to multimodel",
+                  file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001 — never go without a forecast
-            import sys
+            tried.append(("native", "unavailable"))
             print(f"[product] native engine failed ({type(exc).__name__}: {exc}); "
-                  "falling back to ECMWF+GFS GRIB", file=sys.stderr, flush=True)
-    if engine == "multimodel" and run is None:
+                  "falling back to multimodel", file=sys.stderr, flush=True)
+    # Open-Meteo is the primary for engine="multimodel" and the first fallback for
+    # "native": a different provider entirely, so it still answers when the cloud
+    # buckets the native and GRIB paths share are down.
+    if engine in ("multimodel", "native") and run is None:
         try:
-            return compute_multimodel(points, county=county, seat=seat, days=days, tz=tz, want_pop=want_pop,
-                                      workers=workers, issue_utc=issue_utc, sess=sess, hourly=hourly,
-                                      calibrate=calibrate, verify_root=verify_root,
-                                      min_age_hours=min_age_hours)
+            prod, hdoc = compute_multimodel(points, county=county, seat=seat, days=days, tz=tz,
+                                            want_pop=want_pop, workers=workers, issue_utc=issue_utc, sess=sess,
+                                            hourly=hourly, calibrate=calibrate, verify_root=verify_root,
+                                            min_age_hours=min_age_hours)
+            return _mark_fallback(prod, tried), hdoc
         except Exception as exc:  # noqa: BLE001 — never go without a forecast
-            import sys
+            tried.append(("multimodel", "unavailable"))
             print(f"[product] multimodel engine failed ({type(exc).__name__}: {exc}); "
                   "falling back to ECMWF+GFS GRIB", file=sys.stderr, flush=True)
     if run is None:
@@ -638,6 +678,7 @@ def compute_bundle(points: list[Township], *, county: str, seat: str, days: int 
                  ens_run=str(ens_run) if ens_run else None)
     prod["meta"]["engine"] = "grib"
     prod["meta"]["calibration"] = None
+    _mark_fallback(prod, tried)
     if not hourly:
         return prod, None
 

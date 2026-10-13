@@ -3,6 +3,10 @@ Description=wxgrid — compute and publish the township forecast product
 Documentation=file:/opt/wxgrid/README.md
 After=network-online.target
 Wants=network-online.target
+# Retry budget (see Restart= below): the first attempt plus 3 retries within 6 h,
+# then the unit stays failed until the next timer firing (12 h later, outside the window).
+StartLimitIntervalSec=6h
+StartLimitBurst=4
 
 [Service]
 # Shares the wxgrid.slice envelope (30 % CPU / 50 % RAM for everything wxgrid).
@@ -11,17 +15,26 @@ Type=oneshot
 WorkingDirectory=/opt/wxgrid
 Environment=PYTHONUNBUFFERED=1
 Environment=WXGRID_CACHE=/var/lib/wxgrid/cache
-# Engine: the default is the 8-model Open-Meteo one. To run without Open-Meteo,
-# seed the archive once (`python3 -m wxgrid backfill --townships ... --days 60`)
-# and add `--engine native` below; see README「自主引擎」.
+# Engine: native (ECMWF + NOAA open data, our own station-trained consensus).
+# Seed its archive once before enabling the timer (1.5-3 h, mostly network). Without
+# it, issues go through the Open-Meteo fallback until the first station pairs exist,
+# then run on a calibration fitted to only a few days, which was never backtested:
+#   python3 -m wxgrid backfill --townships /opt/wxgrid/yanshan_townships.csv --days 60 --data-dir /var/lib/wxgrid
+# Fallbacks, each marked on the page and in /api/health ("degraded"): Open-Meteo
+# multi-model, then raw ECMWF IFS + GFS. See README「自主引擎」.
 ExecStart=/usr/bin/python3 -m wxgrid publish \
     --townships /opt/wxgrid/yanshan_townships.csv \
     --county 铅山县 --seat 河口镇 \
     --data-dir /var/lib/wxgrid \
-    --days 5 --workers 2 --keep 60
+    --days 5 --workers 2 --keep 60 --engine native
 
 # One cycle (daily + hourly) is ~10 min wall / ~2.3 min CPU. Kill it well before the next timer.
 TimeoutStartSec=45min
+# A failed or timed-out issue (every engine and the GRIB fallback down, a mirror
+# throttling) is retried 15 min later instead of leaving the page on the previous
+# issue for 12 h. Needs systemd >= 244 (Debian 11+, Ubuntu 22.04+) for oneshot units.
+Restart=on-failure
+RestartSec=15min
 
 # --- resource envelope: stay near 30 % of a 4-core / 8 GB box ---
 Nice=15

@@ -29,6 +29,7 @@ import json
 import os
 import pathlib
 import struct
+import threading
 from typing import Iterable
 
 import numpy as np
@@ -104,6 +105,13 @@ def _to_canonical(values: np.ndarray, units: str, field: str) -> np.ndarray:
     return values
 
 
+#: ecCodes is not safe to call from several threads at once: the fetchers decode
+#: inside their download pools, and on the Windows wheel (2.49) two concurrent
+#: decodes abort the whole process (0xC0000409). Downloads stay parallel; only
+#: the decode — a few ms per message on these small grids — is serialised.
+_ECCODES_LOCK = threading.Lock()
+
+
 def decode_box(msg: bytes, box: Box) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """One message -> ``(values[lat, lon], lat (descending), lon (ascending), keys)``.
 
@@ -112,19 +120,20 @@ def decode_box(msg: bytes, box: Box) -> tuple[np.ndarray, np.ndarray, np.ndarray
     """
     import eccodes
 
-    h = eccodes.codes_new_from_message(msg)
-    try:
-        keys = {k: eccodes.codes_get(h, k) for k in
-                ("shortName", "units", "stepRange", "Ni", "Nj", "iDirectionIncrementInDegrees",
-                 "jDirectionIncrementInDegrees", "latitudeOfFirstGridPointInDegrees",
-                 "longitudeOfFirstGridPointInDegrees", "jScansPositively")}
-        if eccodes.codes_get(h, "bitmapPresent"):
-            eccodes.codes_set(h, "missingValue", 9.999e20)
-        vals = eccodes.codes_get_values(h).astype(float)
-        if eccodes.codes_get(h, "bitmapPresent"):
-            vals[vals >= 9.99e20] = np.nan
-    finally:
-        eccodes.codes_release(h)
+    with _ECCODES_LOCK:
+        h = eccodes.codes_new_from_message(msg)
+        try:
+            keys = {k: eccodes.codes_get(h, k) for k in
+                    ("shortName", "units", "stepRange", "Ni", "Nj", "iDirectionIncrementInDegrees",
+                     "jDirectionIncrementInDegrees", "latitudeOfFirstGridPointInDegrees",
+                     "longitudeOfFirstGridPointInDegrees", "jScansPositively")}
+            if eccodes.codes_get(h, "bitmapPresent"):
+                eccodes.codes_set(h, "missingValue", 9.999e20)
+            vals = eccodes.codes_get_values(h).astype(float)
+            if eccodes.codes_get(h, "bitmapPresent"):
+                vals[vals >= 9.99e20] = np.nan
+        finally:
+            eccodes.codes_release(h)
     ni, nj = int(keys["Ni"]), int(keys["Nj"])
     di, dj = float(keys["iDirectionIncrementInDegrees"]), float(keys["jDirectionIncrementInDegrees"])
     lat0, lon0 = float(keys["latitudeOfFirstGridPointInDegrees"]), float(keys["longitudeOfFirstGridPointInDegrees"])

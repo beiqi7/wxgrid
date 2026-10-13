@@ -1,16 +1,19 @@
 # wxgrid
 
-乡镇级精细化天气预报。**8 家全球模式**（ECMWF IFS / AIFS、DWD ICON、UKMO、CMA GRAPES、CMC GEM、
-Météo-France ARPEGE、NOAA AIGFS）按乡镇实际海拔取点、等权平均，再用周边 7 个国家站的实况做**滚动
-偏差订正和降水分位数映射**；按北京时分**白天（08—20 时）/ 夜间（20—次日 08 时）**写五天预报，另给
-0—72 小时逐3小时预报。GEFS 21 成员的降水概率只放在明细里，不进预报用语。产出文字预报、结构化 JSON、
-只读 API 和 Web 页面；页面上公开样本外检验成绩。
+乡镇级精细化天气预报。按北京时分**白天（08—20 时）/ 夜间（20—次日 08 时）**写五天预报，另给
+0—72 小时逐3小时预报；产出文字预报、结构化 JSON、只读 API 和 Web 页面，页面上公开样本外检验成绩。
 
-取不到多模式数据时自动退回 ECMWF IFS + NOAA GFS 原始 GRIB 方案（本地按递减率降尺度，不做站点订正）。
+部署默认用**自主引擎** `--engine native`，**不经任何中间服务**：直接读 ECMWF（IFS、AIFS）与 NOAA（GFS、GEFS）
+开放数据的原始 GRIB（每家都有 AWS → Google Cloud → 生产方自己服务器的多个镜像），本地降尺度，用自己存档的
+历史预报对周边 7 个国家站训练加权共识和订正。方法、回测成绩和部署步骤见下方「自主引擎」。
 
-另有**自主引擎** `--engine native`，**不经 Open-Meteo 或任何第三方服务**：直接读 ECMWF（IFS、AIFS）
-与 NOAA（GFS、GEFS）开放数据的原始 GRIB，本地降尺度，用自己存档的历史预报对周边国家站训练加权共识和订正，
-数据全部允许商用。产品格式与页面完全相同。方法、回测成绩和切换步骤见下方「自主引擎」。
+自主引擎出不了预报时（所有镜像都取不到、或还没有站点订正）依次退回：
+1. **多模式方案** `--engine multimodel`：经 Open-Meteo 取 8 家全球模式（ECMWF IFS / AIFS、DWD ICON、UKMO、
+   CMA GRAPES、CMC GEM、Météo-France ARPEGE、NOAA AIGFS）等权平均，再做滚动偏差订正和降水分位数映射。
+   Open-Meteo 免费额度仅限非商业用途。
+2. **GRIB 方案**：ECMWF IFS + NOAA GFS 原始 GRIB，本地按递减率降尺度，不做站点订正。
+
+退回时产品带 `meta.fallback`，页面顶部写明原因，`/api/health` 报 `degraded`。产品格式与页面完全相同。
 
 - 代码：`/opt/wxgrid`
 - 数据：`/var/lib/wxgrid`（产品 JSON + GRIB 缓存，不进 git）
@@ -24,13 +27,12 @@ cd /opt/wxgrid
 # 1. 乡镇表（已有 yanshan_townships.csv，可跳过）
 python3 -m wxgrid townships --wikidata 铅山县 --out yanshan_townships.csv --dem-cache ./dem-cache
 
-# 2. 打印一份预报（约 10 分钟，联网下载）
-python3 -m wxgrid bulletin --townships yanshan_townships.csv \
-    --county 铅山县 --seat 河口镇 --days 5
+# 2. 自主引擎一次性补存档：60 天历史预报 + 实况，拟合订正、回测（约 1.5–3 小时，网络为主）
+python3 -m wxgrid backfill --townships yanshan_townships.csv --days 60 --data-dir /var/lib/wxgrid
 
-# 3. 产出一份产品到数据目录（Web/API 读它）
+# 3. 产出一份产品到数据目录（Web/API 读它；约 3 分钟）
 python3 -m wxgrid publish --townships yanshan_townships.csv \
-    --county 铅山县 --seat 河口镇 --data-dir /var/lib/wxgrid
+    --county 铅山县 --seat 河口镇 --data-dir /var/lib/wxgrid --engine native
 
 # 4. 起服务
 python3 -m wxgrid serve --host 0.0.0.0 --port 8790 --data-dir /var/lib/wxgrid
@@ -41,16 +43,41 @@ python3 -m wxgrid serve --host 0.0.0.0 --port 8790 --data-dir /var/lib/wxgrid
 ```bash
 install -m644 deploy/*.slice deploy/*.service deploy/*.timer /etc/systemd/system/
 systemctl daemon-reload
+# 先跑完上面第 2 步的 backfill，再开定时器
 systemctl enable --now wxgrid-web.service wxgrid-publish.timer
 ```
+
+发布单元用 `--engine native`。没跑 backfill 就开定时器也能出预报：自主引擎照常取数、存档，但因为还没有站点订正，
+产品经 Open-Meteo 多模式方案出（页面和 `/api/health` 都会标明）；存档里攒出第一批站点配对后（几天）自主引擎
+自动接手，但那时的订正只用了几天数据、没有回测过，所以还是建议先 backfill。
 
 - `wxgrid-publish.timer` 每天北京时 **07:30 / 19:30** 各跑一次（各带 ≤10 分钟随机延迟）。
   07:30 发布的产品从**今天白天**开始（10 个时段 = 5 整天），19:30 发布的从**今天夜间**开始
   （今晚 + 5 整天 = 11 个时段）。起报时次取所有源都发布到所需时效的最新一个（通常 07:30 用前一天
   12Z、19:30 用当天 00Z 或 06Z）。publish 先解析时次与首个时段：同一时次、同一首时段、当前格式的
   产品已在盘上就直接返回，不下载；否则（旧格式、缺逐时文件、同一时次换了发布时段）重算。
-- `wxgrid-web.service` 常驻，只读 `/var/lib/wxgrid`，不做任何计算。
+  某次发布失败（所有引擎和 GRIB 退回都取不到数据、超时）时 15 分钟后自动重试，6 小时内最多 4 次
+  （`Restart=on-failure`，需 systemd ≥ 244）。
+- `wxgrid-web.service` 常驻，只读 `/var/lib/wxgrid`，不做任何计算；读过的 JSON 按文件 mtime 缓存在内存里，
+  响应按 `Accept-Encoding` gzip 压缩（产品 JSON 重复字段多，压缩后只剩几分之一）。
 - 换县：改 `wxgrid-publish.service` 里的 `--townships/--county/--seat`。
+
+### 对外服务：反代与监控
+
+```bash
+install -m644 deploy/nginx-wxgrid.conf /etc/nginx/conf.d/wxgrid.conf   # 改 server_name 和证书路径
+nginx -t && systemctl reload nginx
+# 然后把 wxgrid-web.service 的 --host 改成 127.0.0.1，只让 nginx 访问 8790
+```
+
+模板做了 TLS、按 IP 限流（`/api/` 10 次/秒，突发 40）、按上游 `Cache-Control` 短时缓存（最新产品 5 分钟、
+历史 run 1 小时），上游挂了时继续给缓存里的旧响应。
+
+**监控**：探测 `GET /api/health`。最新产品超过 14 小时没更新（`WXGRID_STALE_HOURS`，即至少漏了一次发布）
+返回 **503** `status: "stale"`，从未发布过返回 503 `status: "empty"`，正常为 200 `status: "ok"`；
+响应里有 `age_hours`、`generated`、`engine` 和本次产品的运行提示 `health[]`。任何能按 HTTP 状态码告警的
+探测（Uptime Kuma、云监控、`curl -f` + cron）都能直接用。页面在产品过期时顶部也会写明“预报已 N 小时未更新”，
+开着不关的页面每 10 分钟查一次新发布并自动换上。
 
 ### 资源限额
 
@@ -97,11 +124,11 @@ GRIB 缓存（`$WXGRID_CACHE`，目前只缓存 GFS）超过 36 小时的条目�
 
 无鉴权，只读，`Access-Control-Allow-Origin: *`。当前绑 `0.0.0.0:8790`，公网可达。
 进程跑在 `ProtectSystem=strict` + `ReadOnlyPaths` 下，写不了任何东西，数据目录也无密钥，
-所以最坏情况是数据被免费取用，不会被篡改。正式对外建议挂到现有反代加 TLS 与限流。
+所以最坏情况是数据被免费取用，不会被篡改。正式对外用 `deploy/nginx-wxgrid.conf` 加 TLS 与限流（见上方「对外服务」）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 状态、已存 run 数、最新 run |
+| GET | `/api/health` | 状态与新鲜度：`ok`（200）/ `stale`、`empty`（503），已存 run 数、最新 run、`age_hours` |
 | GET | `/api/latest` | 最新产品全量 JSON |
 | GET | `/api/summary` | 仅 meta + 结论 + 每日县级摘要（小体积） |
 | GET | `/api/runs` | 历史 run 索引，新→旧 |
@@ -168,7 +195,9 @@ points{id: {name, lat, lon, elevation,
 | 高温 | 日最高 ≥40 ℃ | ≥37 ℃ | 连续三天 ≥35 ℃ | — | ≥35 ℃ |
 | 霜冻 | — | — | — | — | 夜间最低 ≤0 ℃ |
 
-## 模型选择与订正（`wxgrid/verify.py`、`wxgrid/postproc.py`）
+## 多模式方案：模型选择与订正（`wxgrid/verify.py`、`wxgrid/postproc.py`）
+
+现在是自主引擎的第一道备用；`--engine multimodel` 也可以单独用。
 
 **怎么选的**：用 OGIMET 转发的 SYNOP 实况（武夷山 58730、邵武 58725、浦城 58731、南城 58715、
 景德镇 58527、衢州 58633、南昌 58606，另有庐山 58506 只作高山参考），对 Open-Meteo *Previous Runs*
@@ -213,10 +242,10 @@ ICON 是三角网格、在这台机器上太重。自主引擎只用生产方直
 
 | 成员 | 生产方 | 分辨率 · 步长 | 用途 | 许可 · 来源 |
 |---|---|---|---|---|
-| IFS HRES | ECMWF | 0.25° · 3 h（00/12 UTC 到 144 h） | 共识成员；带 3 h 极值 | 开放数据 CC BY 4.0 · AWS 镜像，退回 data.ecmwf.int |
+| IFS HRES | ECMWF | 0.25° · 3 h（00/12 UTC 到 144 h） | 共识成员；带 3 h 极值 | 开放数据 CC BY 4.0 · AWS → Google Cloud → data.ecmwf.int |
 | AIFS Single | ECMWF | 0.25° · 6 h | 共识成员（AI 模式） | 同上 |
-| GFS | NOAA | 0.25° · 3 h | 共识成员；带 6 h 极值 | 公有领域 · NOAA Open Data on AWS |
-| GEFS | NOAA | 0.5° · 6 h 降水，21 成员 | 只给逐3小时明细的降水概率 | 同上 |
+| GFS | NOAA | 0.25° · 3 h | 共识成员；带 6 h 极值 | 公有领域 · AWS → Google Cloud → NOMADS |
+| GEFS | NOAA | 0.5° · 6 h 降水，21 成员 | 只给逐3小时明细的降水概率 | 公有领域 · AWS → Google Cloud |
 | SYNOP 实况 | 7 个国家站 | 3 h | 训练与检验 | 经 OGIMET，与多模式方案共用 `verify/obs` |
 
 每个要素按 GRIB 索引按字节范围单独读取、用 ecCodes 解码后**裁到县域周边一小块**（含 7 个国家站，约 15×18 个格点），
@@ -226,8 +255,8 @@ ICON 是三角网格、在这台机器上太重。自主引擎只用生产方直
 
 ### 流程
 
-1. **选时次**：取 3 家里至少 2 家已发布到所需时效的最新 00/12 UTC 时次（IFS 的 06/18 UTC 只到 90 h）。
-   缺一家照常出（权重按比例补足），少于 2 家则退回 GRIB 方案。
+1. **选时次**：取 3 家里至少 2 家已发布到所需时效的最新 00/12 UTC 时次（IFS 的 06/18 UTC 只到 90 h），
+   任一镜像有就算。缺一家照常出（权重按比例补足）；少于 2 家、或还没有站点订正时，退回多模式方案，再不行退回 GRIB 方案。
 2. **降尺度**：双线性插值到乡镇；气温按海拔订正 `T = T格点 + γ (z乡镇 − z模式)`，
    **白天 γ = −6.5 K/km，夜间 γ 取模式自己在当地的递减率**（周边 5×5 格点气温对地形回归，限 −9.8…+4 K/km），
    保留山谷逆温。AIFS 6 小时一步，3 小时值按时间插值、降水均分。
@@ -350,25 +379,33 @@ ICON 是三角网格、在这台机器上太重。自主引擎只用生产方直
 
 ### 部署与切换
 
+`deploy/wxgrid-publish.service` 已经是 `--engine native`。上线前：
+
 ```bash
-# 1. 一次性：从 AWS 历史数据补齐 60 天存档，再补实况、拟合、回测（网络为主，约 1.5–3 小时）
+# 1. 一次性：从历史开放数据补齐 60 天存档，再补实况、拟合、回测（网络为主，约 1.5–3 小时）
 python3 -m wxgrid backfill --townships yanshan_townships.csv --days 60 --data-dir /var/lib/wxgrid
 
-# 2. 同一批站、同 30 天、同一套评分，对比两套引擎的样本外成绩
+# 2. 看样本外成绩；已有多模式方案的成绩时可以并排比（同一批站、同 30 天、同一套评分）
 python3 -m wxgrid verify --engine native --force
-python3 -m wxgrid verify --force
-python3 -m wxgrid verify --compare        # 两套成绩并排；切换后还会显示"实际发布的预报"一行
+python3 -m wxgrid verify --compare        # 切换后还会显示"实际发布的预报"一行
 
-# 3. 切换：wxgrid-publish.service 的 ExecStart 里加 --engine native，然后
-systemctl daemon-reload
+# 3. 装单元、开定时器（见上方「部署」）
 ```
 
 - 一次发布实测（3 家齐全）：墙钟约 3 分钟（含补 OGIMET 实况），CPU 约 35 秒，峰值约 400 MB；按索引读约 0.8 GB GRIB 字节范围
   （IFS 330、GFS 300、AIFS 110、GEFS 50 MB，只在内存里解码裁剪，不落盘）。
   backfill 每个时次约 1–1.5 分钟（受 AWS 限速）。
-- 切换后每次发布都把当次 4 家数据存进 `archive/`，训练集自动滚动更新，不用再跑 backfill；同时把站点位置上的预报记进
+- 每次发布都把当次 4 家数据存进 `archive/`，训练集自动滚动更新，不用再跑 backfill；同时把站点位置上的预报记进
   `native/issued/`，一个月后页面检验一节就有"实际发布的预报"成绩和按月汇总，可以长期看季节变化和有没有退化。
-- ECMWF 的 AWS 镜像持续高频访问会回 503 SlowDown（实测连续半小时 20 次/秒触发），所以限速 8 次/秒，失败时改读 data.ecmwf.int。
+  退回其他引擎的那次也照样存档（只是不记 `issued`），训练集不会因为一次退回断档。
+- **镜像**：每家数据按 AWS → Google Cloud 公开副本 →（GFS）NOMADS /（ECMWF）data.ecmwf.int 的顺序读，哪个先答就在
+  这次发布里优先用它，不会每个字节范围都重新试一遍。各镜像的文件逐字节相同（2026-10 实测：索引偏移一致，抽样字节范围
+  哈希相同），所以索引和数据可以来自不同镜像。ECMWF 的 AWS 镜像持续高频访问会回 503 SlowDown（实测连续半小时 20 次/秒
+  触发，冒烟测试时也遇到过），所以限速 8 次/秒；NOMADS 只保留约 10 天、限速 1.5 次/秒，只作最后一道。
+  `WXGRID_ECMWF_BASE` / `WXGRID_GFS_BASE` / `WXGRID_GEFS_BASE` 可以钉死某一个。
+- **退回**：所有镜像都取不到 2 家、或还没有站点订正时，这一期改用多模式方案（Open-Meteo），再不行用 GRIB 方案。
+  产品 `meta.fallback` 记下原因（`not_calibrated` / `unavailable`），页面顶部写一句，`/api/health` 报
+  `"status": "degraded"`（仍是 200）。监控按关键词 `"status":"ok"` 告警就能发现"连续在用备用引擎"。
 
 ### 局限
 
@@ -380,9 +417,11 @@ systemctl daemon-reload
 - 大雨以上概率在秋冬几乎没有技巧（样本只有几十次）；窗口里 ≥15 mm 不足 8 次时不给。
 - 回测实况一部分是 ISD 的 12 h 极值（已与 3 小时实况比对筛过），口径与生产上 OGIMET 的 24 h 极值略有差别；
   降水只有 3 个站有报文原文，样本较少；2025—26 冬季只有 3 个站。
-- 存档不足（新部署且没跑 backfill）时只做等权平均、不订正，页面顶部和检验一节都会说明。
-- 实况仍只有 OGIMET 一个来源。NOAA 的 GHCNh 只收了这 7 站里的 3 个（另有庐山），而且 2026 年 4 月起记录里不再附带报文原文
-  （没有 24 h 极值），也有约一周的延迟，不能做备份。
+- 存档不足（新部署且没跑 backfill）时退回多模式方案；攒出第一批站点配对后自主引擎自动接手，但那时的订正只用了几天数据，
+  没有回测过。
+- **实况仍只有 OGIMET 一个来源**，这是自主引擎剩下的单点。NOAA 的 GHCNh 只收了这 7 站里的 3 个（另有庐山），而且
+  2026 年 4 月起记录里不再附带报文原文（没有 24 h 极值），也有约一周的延迟，不能做备份。OGIMET 停更时：订正沿用上一份
+  （7 天内），页面提示"实况已 N 天未更新"；超过 7 天没有可用订正，就退回多模式方案。
 
 ## CLI
 
@@ -446,5 +485,5 @@ cd /opt/wxgrid && python3 -m pytest tests -q
 - 逐时降水概率是所在 6 小时 GEFS 时段的概率，不是该小时本身的概率。
 - 多模式与 GRIB 方案的融合风速由加权后的 u/v 求模，成员风向分歧大时会略低于成员风速的加权平均
   （自主引擎改为各家风速平均再按实况比例订正）。
-- API 无鉴权且绑 `0.0.0.0:8790`，公网可读全部预报数据（只读，无法篡改）。
-- 内置 HTTP 服务是 Python `http.server`，够用但不抗高并发，正式对外建议走反代。
+- API 无鉴权且默认绑 `0.0.0.0:8790`，公网可读全部预报数据（只读，无法篡改）；挂反代后改绑 127.0.0.1。
+- 内置 HTTP 服务是 Python `http.server`，够用但不抗高并发，正式对外走反代（模板带缓存，大部分请求不到 Python）。

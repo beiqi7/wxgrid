@@ -247,9 +247,58 @@ def test_ecmwf_falls_back_to_the_next_mirror(monkeypatch):
             raise RuntimeError("503 SlowDown")
         return b"ok"
     monkeypatch.setattr(raw, "ECMWF_BASES", ("https://mirror-a", "https://mirror-b"))
+    monkeypatch.setattr(raw, "_pref", {})
     monkeypatch.setattr(raw, "get", fake_get)
     assert raw._ecmwf_get(None, "x/y.index") == b"ok"
     assert seen == ["https://mirror-a/x/y.index", "https://mirror-b/x/y.index"]
+
+
+def test_gfs_and_gefs_fail_over_to_the_next_mirror_and_stay_there(monkeypatch):
+    """AWS down: the GFS index and byte ranges come from the next mirror, which is then tried first."""
+    seen = []
+
+    def fake_get(sess, url, **kw):
+        seen.append(url)
+        if url.startswith("https://gfs-a") or url.startswith("https://gefs-a"):
+            raise RuntimeError("503 SlowDown")
+        return GFS_IDX.encode() if url.endswith(".idx") else b"x" * 10
+    monkeypatch.setattr(raw, "GFS_BASES", ("https://gfs-a", "https://gfs-b", "https://gfs-c"))
+    monkeypatch.setattr(raw, "GEFS_BASES", ("https://gefs-a", "https://gefs-b"))
+    monkeypatch.setattr(raw, "_pref", {})
+    monkeypatch.setattr(raw, "get", fake_get)
+
+    jobs = raw._gfs_jobs(raw.GFS, dt.datetime(2025, 6, 1, 12), 24, ("t2m",), None)
+    assert jobs[0][2] == "gfs.20250601/12/atmos/gfs.t12z.pgrb2.0p25.f024"   # mirror-relative
+    assert seen == ["https://gfs-a/" + jobs[0][2] + ".idx", "https://gfs-b/" + jobs[0][2] + ".idx"]
+    seen.clear()
+    raw._mirror_get("gfs", None, jobs[0][2], byte_range=(100, 109))
+    assert seen == ["https://gfs-b/" + jobs[0][2]], "the mirror that worked is tried first"
+    seen.clear()
+    raw._mirror_get("gefs", None, "gefs.x.idx")
+    assert seen == ["https://gefs-a/gefs.x.idx", "https://gefs-b/gefs.x.idx"]  # families are separate
+
+
+def test_mirror_get_raises_once_every_mirror_failed(monkeypatch):
+    def fake_get(sess, url, **kw):
+        raise RuntimeError("down")
+    monkeypatch.setattr(raw, "GFS_BASES", ("https://gfs-a", "https://gfs-b"))
+    monkeypatch.setattr(raw, "_pref", {})
+    monkeypatch.setattr(raw, "get", fake_get)
+    with pytest.raises(RuntimeError, match="no gfs mirror"):
+        raw._mirror_get("gfs", None, "x")
+
+
+def test_probe_finds_a_cycle_on_any_mirror(monkeypatch):
+    heads = []
+
+    def fake_head(sess, url, timeout=20):
+        heads.append(url)
+        return url.startswith("https://gfs-b")
+    monkeypatch.setattr(raw, "GFS_BASES", ("https://gfs-a", "https://gfs-b"))
+    monkeypatch.setattr(raw, "_pref", {})
+    monkeypatch.setattr(raw, "head_ok", fake_head)
+    assert raw.probe(raw.GFS, dt.datetime(2025, 6, 1, 12), 120, sess=object())
+    assert [h.split("/")[2] for h in heads] == ["gfs-a", "gfs-b"]
 
 
 def test_aifs_path_before_and_after_it_went_operational():

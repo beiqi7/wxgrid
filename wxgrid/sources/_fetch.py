@@ -29,6 +29,10 @@ _HOST_RATE = {
     "data.ecmwf.int": 4.0,
     "noaa-gfs-bdp-pds.s3.amazonaws.com": 25.0,
     "noaa-gefs-pds.s3.amazonaws.com": 50.0,   # ~900 small reads per cycle (21 members x 2 per step)
+    # fallback mirrors (wxgrid.sources.raw): Google Cloud's public copies of ECMWF/GFS/GEFS
+    # share one host; NOMADS blocks clients above ~120 requests a minute.
+    "storage.googleapis.com": 40.0,
+    "nomads.ncep.noaa.gov": 1.5,
 }
 _DEFAULT_RATE = 20.0
 _buckets: dict[str, list[float]] = {}
@@ -118,22 +122,25 @@ def decode_grib(blob: bytes) -> xr.Dataset:
     ``cfgrib`` splits messages into hypercubes (one per height above ground),
     so several datasets come back and have to be merged on the shared grid.
     """
+    from ..gribbox import _ECCODES_LOCK  # ecCodes is not thread-safe (see there)
+
     fd, path = tempfile.mkstemp(suffix=".grib2")
     try:
         os.write(fd, blob)
         os.close(fd)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            parts = cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""})
-        if not parts:
-            raise ValueError("no GRIB messages decoded")
-        # Scalar coords (step, time, heightAboveGround, surface, ...) differ between
-        # hypercube groups and would block the merge; the callers rebuild them.
-        cleaned = [d.drop_vars([c for c in d.coords if c not in d.dims], errors="ignore") for d in parts]
-        merged = xr.merge(cleaned, compat="override", join="exact")
-        merged.attrs.pop("history", None)
-        # cfgrib is lazy and keeps the temp path; materialise before we unlink it.
-        return merged.load()
+        with _ECCODES_LOCK:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                parts = cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""})
+            if not parts:
+                raise ValueError("no GRIB messages decoded")
+            # Scalar coords (step, time, heightAboveGround, surface, ...) differ between
+            # hypercube groups and would block the merge; the callers rebuild them.
+            cleaned = [d.drop_vars([c for c in d.coords if c not in d.dims], errors="ignore") for d in parts]
+            merged = xr.merge(cleaned, compat="override", join="exact")
+            merged.attrs.pop("history", None)
+            # cfgrib is lazy and keeps the temp path; materialise before we unlink it.
+            return merged.load()
     finally:
         if os.path.exists(path):
             os.unlink(path)

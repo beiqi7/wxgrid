@@ -15,6 +15,10 @@ All three are free for commercial use (ECMWF asks for attribution). Cycles:
 IFS 00/12 UTC reach 240 h (3-hourly to 144 h), 06/18 UTC reach 90 h; AIFS and
 GFS run four times a day well past 5 days.
 
+Each family has fallback mirrors (Google Cloud's public copies, then the
+producer's own server), so one cloud bucket throttling or down does not stop a
+publish; see :data:`ECMWF_BASES`, :data:`GFS_BASES`, :data:`GEFS_BASES`.
+
 Archive depth on AWS (checked 2026-10): IFS 0.25° since 2024-02, AIFS Single
 since 2025-02, GFS since 2021 — enough to backfill a calibration window.
 """
@@ -33,11 +37,65 @@ from .. import gribbox
 from ..gribbox import Box, BoxRun
 from ._fetch import get, head_ok, session
 
-#: ECMWF open data mirrors, tried in order: the AWS copy, then ECMWF's own server.
-#: ``WXGRID_ECMWF_BASE`` pins a single one.
+#: Mirrors per data family, tried in order; the first one that answers is then
+#: preferred for the rest of the process (see :func:`_mirror_get`). The cloud
+#: copies are byte-identical to the producers' files (same index offsets; checked
+#: 2026-10: GFS/GEFS/IFS ranges on AWS and GCP hash the same), so an index read
+#: from one mirror is good for a byte range on another.
+#: ``WXGRID_ECMWF_BASE`` / ``WXGRID_GFS_BASE`` / ``WXGRID_GEFS_BASE`` pin one each.
 ECMWF_BASES = ((os.environ["WXGRID_ECMWF_BASE"],) if os.environ.get("WXGRID_ECMWF_BASE") else
-               ("https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com", "https://data.ecmwf.int/forecasts"))
-GFS_BASE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+               ("https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com",
+                "https://storage.googleapis.com/ecmwf-open-data",
+                "https://data.ecmwf.int/forecasts"))
+#: NOMADS keeps only ~10 days and rate-limits hard: last resort for the live cycle.
+GFS_BASES = ((os.environ["WXGRID_GFS_BASE"],) if os.environ.get("WXGRID_GFS_BASE") else
+             ("https://noaa-gfs-bdp-pds.s3.amazonaws.com",
+              "https://storage.googleapis.com/global-forecast-system",
+              "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"))
+#: GEFS needs ~900 small reads a cycle, too many for NOMADS' limits; probabilities are detail only.
+GEFS_BASES = ((os.environ["WXGRID_GEFS_BASE"],) if os.environ.get("WXGRID_GEFS_BASE") else
+              ("https://noaa-gefs-pds.s3.amazonaws.com",
+               "https://storage.googleapis.com/gfs-ensemble-forecast-system"))
+GFS_BASE = GFS_BASES[0]  # kept for callers that only want the primary
+
+
+def _bases(family: str) -> tuple[str, ...]:
+    # read at call time so tests (and an operator's env) can swap them
+    return {"ecmwf": ECMWF_BASES, "gfs": GFS_BASES, "gefs": GEFS_BASES}[family]
+
+
+#: Index of the mirror that last served each family's tuple of bases.
+_pref: dict[tuple[str, ...], int] = {}
+
+
+def _mirror_get(family: str, sess, rel: str, *, byte_range=None, timeout: int = 90) -> bytes:
+    """GET ``rel`` from the family's mirrors, starting with the last one that worked.
+
+    A mirror that is throttling (S3 503 SlowDown) or down gets a few attempts
+    before the next is tried; the last one gets the full retry budget. Whichever
+    serves the request becomes the first choice for the next one, so a whole
+    publish does not pay the failover delay on every byte range.
+    """
+    bases = _bases(family)
+    start = _pref.get(bases, 0) % len(bases)
+    order = [bases[(start + k) % len(bases)] for k in range(len(bases))]
+    last: Exception | None = None
+    for k, base in enumerate(order):
+        try:
+            blob = get(sess, f"{base}/{rel}", byte_range=byte_range, timeout=timeout,
+                       retries=6 if k == len(order) - 1 else 3)
+            _pref[bases] = bases.index(base)
+            return blob
+        except Exception as exc:  # noqa: BLE001 — try the next mirror
+            last = exc
+    raise RuntimeError(f"no {family} mirror served {rel}") from last
+
+
+def _mirror_ok(family: str, sess, rel: str) -> bool:
+    """Does any mirror of the family have ``rel``? (HEAD, preferred mirror first.)"""
+    bases = _bases(family)
+    start = _pref.get(bases, 0) % len(bases)
+    return any(head_ok(sess, f"{bases[(start + k) % len(bases)]}/{rel}") for k in range(len(bases)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,31 +168,29 @@ def _ecmwf_dir(model: Model, init: dt.datetime) -> str:
 
 
 def _ecmwf_get(sess, rel: str, *, byte_range=None) -> bytes:
-    """GET from the first mirror that answers (the AWS copy throttles with 503 SlowDown under load)."""
-    last: Exception | None = None
-    for base in ECMWF_BASES:
-        try:
-            return get(sess, f"{base}/{rel}", byte_range=byte_range, timeout=90, retries=6)
-        except Exception as exc:  # noqa: BLE001 — try the next mirror
-            last = exc
-    raise RuntimeError(f"no ECMWF mirror served {rel}") from last
+    """GET from the ECMWF mirrors (the AWS copy throttles with 503 SlowDown under load)."""
+    return _mirror_get("ecmwf", sess, rel, byte_range=byte_range)
 
 
 def _ecmwf_stem(init: dt.datetime, step: int) -> str:
     return f"{init:%Y%m%d%H}0000-{step}h-oper-fc"
 
 
+def _gfs_rel(init: dt.datetime, step: int) -> str:
+    """A GFS file's path relative to a mirror base."""
+    return f"gfs.{init:%Y%m%d}/{init:%H}/atmos/gfs.t{init:%H}z.pgrb2.0p25.f{step:03d}"
+
+
 def _gfs_url(init: dt.datetime, step: int) -> str:
-    return f"{GFS_BASE}/gfs.{init:%Y%m%d}/{init:%H}/atmos/gfs.t{init:%H}z.pgrb2.0p25.f{step:03d}"
+    return f"{GFS_BASE}/{_gfs_rel(init, step)}"
 
 
 def probe(model: Model, init: dt.datetime, step: int, sess=None) -> bool:
-    """Is the cycle published out to ``step``?"""
+    """Is the cycle published out to ``step`` (on any mirror)?"""
     sess = sess or session()
     if model.key == "gfs":
-        return head_ok(sess, _gfs_url(init, step) + ".idx")
-    rel = f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, step)}.index"
-    return any(head_ok(sess, f"{base}/{rel}") for base in ECMWF_BASES)
+        return _mirror_ok("gfs", sess, _gfs_rel(init, step) + ".idx")
+    return _mirror_ok("ecmwf", sess, f"{_ecmwf_dir(model, init)}/{_ecmwf_stem(init, step)}.index")
 
 
 # ------------------------------------------------------------------ message catalogue
@@ -162,8 +218,8 @@ def _ecmwf_jobs(model: Model, init, step, fields, sess) -> list[tuple]:
 
 
 def _gfs_jobs(model: Model, init, step, fields, sess) -> list[tuple]:
-    url = _gfs_url(init, step)
-    lines = get(sess, url + ".idx", timeout=60).decode("utf-8").strip().splitlines()
+    url = _gfs_rel(init, step)  # mirror-relative, like the ECMWF jobs
+    lines = _mirror_get("gfs", sess, url + ".idx", timeout=60).decode("utf-8").strip().splitlines()
     rows = []
     for line in lines:
         _seq, off, meta = line.split(":", 2)
@@ -196,8 +252,8 @@ def _gfs_jobs(model: Model, init, step, fields, sess) -> list[tuple]:
 
 def _orog_job(model: Model, init, sess, first_step: int) -> tuple | None:
     if model.key == "gfs":
-        url = _gfs_url(init, first_step)
-        lines = get(sess, url + ".idx", timeout=60).decode("utf-8").strip().splitlines()
+        url = _gfs_rel(init, first_step)
+        lines = _mirror_get("gfs", sess, url + ".idx", timeout=60).decode("utf-8").strip().splitlines()
         rows = sorted((int(line.split(":")[1]), line) for line in lines)
         for k, (off, line) in enumerate(rows):
             if ":HGT:surface:" in line and k + 1 < len(rows):
@@ -237,11 +293,9 @@ def fetch(model: Model | str, init: dt.datetime, steps, box: Box, *, fields=None
                 jobs.append(oj)
 
         def one(job):
-            f, step, url, off, length, win = job
-            if model.key == "gfs":
-                blob = get(sess, url, byte_range=(off, off + length - 1), timeout=90)
-            else:  # ECMWF jobs carry a mirror-relative path
-                blob = _ecmwf_get(sess, url, byte_range=(off, off + length - 1))
+            f, step, url, off, length, win = job  # url is mirror-relative
+            blob = _mirror_get("gfs" if model.key == "gfs" else "ecmwf", sess, url,
+                               byte_range=(off, off + length - 1))
             vals, lat, lon, keys = gribbox.decode_box(gribbox.split_messages(blob)[0], box)
             return f, step, gribbox._to_canonical(vals, keys.get("units", ""), f), lat, lon, win
 
@@ -276,14 +330,17 @@ def fetch(model: Model | str, init: dt.datetime, steps, box: Box, *, fields=None
 
 # ------------------------------------------------------------------ ensemble precipitation
 
-GEFS_BASE = "https://noaa-gefs-pds.s3.amazonaws.com"
+GEFS_BASE = GEFS_BASES[0]
 #: Control + 20 perturbed members on the 0.5° grid.
 GEFS_MEMBERS = ("gec00",) + tuple(f"gep{i:02d}" for i in range(1, 21))
 
 
+def _gefs_rel(init: dt.datetime, member: str, step: int) -> str:
+    return f"gefs.{init:%Y%m%d}/{init:%H}/atmos/pgrb2ap5/{member}.t{init:%H}z.pgrb2a.0p50.f{step:03d}"
+
+
 def _gefs_url(init: dt.datetime, member: str, step: int) -> str:
-    return (f"{GEFS_BASE}/gefs.{init:%Y%m%d}/{init:%H}/atmos/pgrb2ap5/"
-            f"{member}.t{init:%H}z.pgrb2a.0p50.f{step:03d}")
+    return f"{GEFS_BASE}/{_gefs_rel(init, member, step)}"
 
 
 def fetch_gefs(init: dt.datetime, steps, box: Box, *, members=GEFS_MEMBERS, sess=None,
@@ -301,13 +358,13 @@ def fetch_gefs(init: dt.datetime, steps, box: Box, *, members=GEFS_MEMBERS, sess
 
     def one(job):
         member, step = job
-        url = _gefs_url(init, member, step)
-        lines = get(sess, url + ".idx", timeout=60).decode("utf-8").strip().splitlines()
+        rel = _gefs_rel(init, member, step)
+        lines = _mirror_get("gefs", sess, rel + ".idx", timeout=60).decode("utf-8").strip().splitlines()
         rows = sorted((int(line.split(":")[1]), line) for line in lines)
         for k, (off, line) in enumerate(rows):
             m = _WINDOW.search(line)
             if ":APCP:surface:" in line and m and int(m.group(2)) - int(m.group(1)) == 6 and k + 1 < len(rows):
-                blob = get(sess, url, byte_range=(off, rows[k + 1][0] - 1), timeout=90)
+                blob = _mirror_get("gefs", sess, rel, byte_range=(off, rows[k + 1][0] - 1))
                 vals, lat, lon, _ = gribbox.decode_box(gribbox.split_messages(blob)[0], box)
                 return member, step, vals, lat, lon
         return member, step, None, None, None
