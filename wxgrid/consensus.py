@@ -30,6 +30,12 @@ and refitted daily. Method chosen by a 2025 backtest (Mar–Aug, see README):
   detail. 中雨以上 (≥5 mm) and 大雨以上 (≥15 mm) per 12 h come from one
   cumulative logit over the three thresholds (shared slopes), so they stay
   ordered and the rare 15 mm events borrow the slope from the commoner ones.
+* **3-hourly curve** — the page's 2 m temperature every 3 hours combines the
+  members' instantaneous values with the weights and bias of its period's
+  extreme (plus the night term on every night window). :func:`backtest`
+  scores it against the stations' 3-hourly reports, and against a bias fitted
+  per local hour and lead day on the same window (:func:`fit_hour_bias`,
+  used live when :data:`HOUR_BIAS` is set).
 
 Everything scored here is out of sample: :func:`backtest` refits for every
 forecast day on periods that ended before it was issued.
@@ -84,6 +90,14 @@ HEAVY_MM = (5.0, 15.0)
 HEAVY_CAP_MM = 10.0
 #: Fewest events in the window to publish each extra probability.
 HEAVY_MIN_EVENTS = {5.0: 20, 15.0: 8}
+#: Local (BJT) hours of the 3-hourly curve: valid times 00, 03, …, 21 UTC, the SYNOP report hours.
+SERIES_HOURS = (2, 5, 8, 11, 14, 17, 20, 23)
+TZ_H = 8
+SERIES_KEYS = [*KEYS, "valid"]
+#: The live 3-hourly curve takes the bias fitted per local hour and lead day
+#: (:func:`fit_hour_bias`, held to the stated 白天最高 / 夜间最低) instead of its
+#: period extreme's. Off until the ``temp_3h`` scores on real data show it helps.
+HOUR_BIAS = False
 
 
 # ------------------------------------------------------------------ training table
@@ -100,19 +114,22 @@ def model_rows(run, sites: list[native.Site]) -> pd.DataFrame:
     return out
 
 
+def _archived(archive_root, member: str, since: dt.datetime | None, until: dt.datetime | None):
+    for init in archive.inits(archive_root, member):
+        if (since and init < since) or (until and init > until):
+            continue
+        run = archive.load(archive_root, member, init)
+        if run is not None:
+            yield run
+
+
 def member_table(archive_root, sites: list[native.Site], *, since: dt.datetime | None = None,
                  until: dt.datetime | None = None, members=MEMBERS, with_gefs: bool = True) -> pd.DataFrame:
     """Wide table, one row per (init, station, period): ``<member>_t``, ``_t_std``, ``_p``, ``_w``
     and ``gefs_pop``/``gefs_pens``."""
     out = None
     for m in (*members, *(("gefs",) if with_gefs else ())):
-        frames = []
-        for init in archive.inits(archive_root, m):
-            if (since and init < since) or (until and init > until):
-                continue
-            run = archive.load(archive_root, m, init)
-            if run is not None:
-                frames.append(model_rows(run, sites))
+        frames = [model_rows(run, sites) for run in _archived(archive_root, m, since, until)]
         if not frames:
             continue
         f = pd.concat(frames, ignore_index=True)
@@ -153,6 +170,86 @@ def training_table(archive_root, obs_root, stations=obs_mod.NEAR_YANSHAN, *,
     tab["init"] = pd.to_datetime(tab["init"])
     tab["end"] = pd.to_datetime(tab["end"])
     return tab.sort_values(["init", "station", "date", "kind"]).reset_index(drop=True)
+
+
+def series_rows(run, sites: list[native.Site], *, days: int = 5) -> pd.DataFrame:
+    """One run's 2 m temperature ``t3`` at every 3-hourly valid time of the periods its issue covers.
+
+    As on the page (:func:`wxgrid.native.member_dataset`): the window ``(valid − 3 h, valid]``
+    belongs to the period it starts in, temperatures take the standard lapse rate
+    in 白天 and the model's own in 夜间, and 6-hourly members are interpolated in time.
+    """
+    cols = [*SERIES_KEYS, "t3"]
+    std = native.point_values(run, sites, lapse="std")
+    if "t2m" not in std:
+        return pd.DataFrame(columns=cols)
+    loc = native.point_values(run, sites, lapse="local")
+    src = run.steps.astype(float)
+    issue = run.init + dt.timedelta(hours=native.ISSUE_DELAY_H)
+    rows = []
+    for date, kind, start, end in native.period_windows(run.init, days):
+        s0, s1 = ((t - run.init).total_seconds() / 3600 for t in (start, end))
+        if s0 < 0 or s1 > src.max():
+            continue
+        hours = np.arange(s0 + 3, s1 + 1, 3)
+        vals = native._interp_steps((std if kind == "day" else loc)["t2m"], src, hours)
+        lead = native.lead_day(end, issue)
+        for j, h in enumerate(hours):
+            valid = (run.init + dt.timedelta(hours=float(h))).isoformat()
+            for i, p in enumerate(sites):
+                rows.append({"init": run.init.isoformat(), "station": p.id, "date": date, "kind": kind,
+                             "lead": lead, "end": end.isoformat(), "valid": valid, "t3": native._num(vals[:, j], i)})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def series_table(archive_root, sites: list[native.Site], *, since: dt.datetime | None = None,
+                 until: dt.datetime | None = None, members=MEMBERS) -> pd.DataFrame:
+    """Wide 3-hourly table, one row per (init, station, valid time): ``<member>_t3``."""
+    out = None
+    for m in members:
+        frames = [series_rows(run, sites) for run in _archived(archive_root, m, since, until)]
+        if not frames:
+            continue
+        f = pd.concat(frames, ignore_index=True).rename(columns={"t3": f"{m}_t3"})
+        out = f if out is None else out.merge(f, on=SERIES_KEYS, how="outer")
+    if out is None:
+        return pd.DataFrame(columns=SERIES_KEYS)
+    for m in members:
+        if f"{m}_t3" not in out:
+            out[f"{m}_t3"] = np.nan
+    return out
+
+
+def observed_series(obs_root, stations, valid: list[str]) -> pd.DataFrame:
+    """Observed 2 m temperature ``o_t3`` per (station, valid time) from the SYNOP reports."""
+    store = obs_mod.ObsStore(obs_root)
+    rows = []
+    for st in stations:
+        recs = store.load(st.wmo)
+        for v in valid:
+            t = (recs.get(v[:16]) or {}).get("t")
+            if t is not None:
+                rows.append({"station": st.id, "valid": v, "o_t3": float(t)})
+    return pd.DataFrame(rows, columns=["station", "valid", "o_t3"])
+
+
+def series_training_table(archive_root, obs_root, stations=obs_mod.NEAR_YANSHAN, *,
+                          since: dt.datetime | None = None, until: dt.datetime | None = None,
+                          periods: pd.DataFrame | None = None) -> pd.DataFrame:
+    """3-hourly member values joined to the observed temperature, lowland stations only, with the
+    local ``hour``; given the period table ``periods`` (:func:`training_table`), also each row's
+    period wind ``<member>_w`` for the night term."""
+    low = [s for s in stations if s.elevation_m < LOWLAND_M]
+    tab = series_table(archive_root, native.sites(obs_mod.as_townships(low)), since=since, until=until)
+    if tab.empty:
+        return tab
+    tab = tab.merge(observed_series(obs_root, low, sorted(tab["valid"].unique())), on=["station", "valid"], how="left")
+    for c in ("init", "end", "valid"):
+        tab[c] = pd.to_datetime(tab[c])
+    tab["hour"] = (tab["valid"] + pd.Timedelta(hours=TZ_H)).dt.hour
+    if periods is not None and len(periods):
+        tab = tab.merge(periods[[*KEYS, *(f"{m}_w" for m in MEMBERS)]], on=KEYS, how="left")
+    return tab.sort_values(["init", "station", "valid"]).reset_index(drop=True)
 
 
 # ------------------------------------------------------------------ temperature
@@ -269,6 +366,78 @@ def consensus_t(cal: dict | None, tab: pd.DataFrame, *, night_wind: bool = True)
             t = t + night_wind_adjust((cal or {}).get("night_wind"), g[[f"{m}_w" for m in MEMBERS]].mean(axis=1).values)
         out[j] = t
     return out
+
+
+# ------------------------------------------------------------------ 3-hourly curve
+
+def _extreme_bias(cal_t: dict | None, kind: str, lead) -> float:
+    e = ((cal_t or {}).get(kind) or {}).get(str(int(lead)))
+    return float(e["a"]) if e else 0.0
+
+
+def hour_bias_delta(cal: dict | None, kind: str, lead, hour) -> float:
+    """What the bias of local ``hour`` (``cal["temp_3h"]``) adds to the period extreme's; 0 where unfitted."""
+    e = ((((cal or {}).get("temp_3h") or {}).get(str(int(lead)))) or {}).get(f"{int(hour):02d}")
+    return float(e["a"]) - _extreme_bias((cal or {}).get("temp"), kind, lead) if e else 0.0
+
+
+def hold_to_extreme(t, kind, extreme) -> np.ndarray:
+    """The curve no warmer than the stated 白天最高 by day, no colder than the 夜间最低 by night
+    (``kind`` a string or one per value; NaN extreme: no limit)."""
+    t, ext = np.asarray(t, dtype=float), np.asarray(extreme, dtype=float)
+    return np.where(np.asarray(kind) == "day", np.fmin(t, ext), np.fmax(t, ext))
+
+
+def series_t(cal: dict | None, s3: pd.DataFrame, *, hour_bias: bool = False, extreme=None) -> np.ndarray:
+    """The 3-hourly curve for every row of a 3-hourly table, as :func:`wxgrid.native.compute` draws it.
+
+    The members are combined with the weights and bias of the row's period kind
+    and lead (:func:`combine_temperature`); nights get the night term of their
+    period's wind. ``hour_bias`` swaps the bias for the one of the row's local
+    hour (:func:`fit_hour_bias`) and holds the curve to the period's stated
+    extreme ``extreme`` (one per row, :func:`hold_to_extreme`).
+    """
+    out = np.full(len(s3), np.nan)
+    pos = {ix: j for j, ix in enumerate(s3.index)}
+    wcols = [f"{m}_w" for m in MEMBERS]
+    for (kind, lead, hour), g in s3.groupby(["kind", "lead", "hour"]):
+        j = np.array([pos[ix] for ix in g.index])
+        t = combine_temperature((cal or {}).get("temp"), kind, int(lead), {m: g[f"{m}_t3"].values for m in MEMBERS})
+        if hour_bias:
+            t = t + hour_bias_delta(cal, kind, lead, hour)
+        if kind == "night" and all(c in g for c in wcols):
+            t = t + night_wind_adjust((cal or {}).get("night_wind"), g[wcols].mean(axis=1).values)
+        out[j] = t
+    if hour_bias and extreme is not None:
+        out = hold_to_extreme(out, s3["kind"].values, extreme)
+    return out
+
+
+def fit_hour_bias(s3: pd.DataFrame, cal: dict, *, half_life: float | None = HALF_LIFE_DAYS) -> dict:
+    """``{lead: {"HH": {"a": bias, "n": pairs}}}`` of the 3-hourly curve per local hour.
+
+    The residual of the curve drawn with ``cal``'s weights and night term but
+    without its bias, averaged with the temperature fit's recency weights.
+    Cells with fewer than :data:`MIN_ROWS` pairs are left out (the extreme's bias stays).
+    """
+    out: dict[str, dict] = {}
+    good = s3.dropna(subset=[*(f"{m}_t3" for m in MEMBERS), "o_t3"])
+    if good.empty:
+        return out
+    a = np.array([_extreme_bias(cal.get("temp"), k, ld) for k, ld in zip(good["kind"], good["lead"])])
+    r = good["o_t3"].values - (series_t(cal, good) - a)
+    w = recency_weights(good, half_life)
+    for (lead, hour), ix in good.groupby(["lead", "hour"]).indices.items():
+        if len(ix) >= MIN_ROWS:
+            out.setdefault(str(int(lead)), {})[f"{int(hour):02d}"] = {
+                "a": round(float(np.average(r[ix], weights=w[ix])), 3), "n": int(len(ix))}
+    return out
+
+
+def period_values(s3: pd.DataFrame, tab: pd.DataFrame, values) -> np.ndarray:
+    """``values`` (one per row of the period table ``tab``) at each row of the 3-hourly table, by period."""
+    v = tab[KEYS].assign(_v=np.asarray(values, dtype=float))
+    return s3[KEYS].merge(v, on=KEYS, how="left")["_v"].values
 
 
 # ------------------------------------------------------------------ precipitation
@@ -475,14 +644,19 @@ def predict_heavy(cal_heavy: dict | None, cal_pm: dict | None, kind: str,
 
 # ------------------------------------------------------------------ fit / apply
 
-def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int = WINDOW_DAYS) -> dict[str, Any]:
-    """Calibration from the rows whose periods ended before ``now``, over ``window_days``."""
+def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int = WINDOW_DAYS,
+        series: pd.DataFrame | None = None) -> dict[str, Any]:
+    """Calibration from the rows whose periods ended before ``now``, over ``window_days``.
+
+    With the 3-hourly table ``series`` (:func:`series_training_table`) it also
+    holds the per-hour bias of the curve, ``temp_3h`` (same rows by period end).
+    """
     now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     tr = tab[(tab["end"] <= now) & (tab["end"] > now - dt.timedelta(days=window_days))] if len(tab) else tab
     dates = sorted(tr["date"].unique()) if len(tr) else []
     temp = fit_temperature(tr)
     pop = fit_pop(tr) if len(tr) else {}
-    return {
+    cal = {
         "method": "weighted member consensus (weights >= 0, sum 1, ridge to equal) + bias, per kind and lead; "
                   "night term on ln(wind); 12 h precipitation quantile map; logistic PoP; "
                   "cumulative logit for >=5 / >=15 mm",
@@ -495,6 +669,10 @@ def fit(tab: pd.DataFrame, *, now: dt.datetime | None = None, window_days: int =
         "heavy": fit_heavy(tr, pop.get("member_qmap")) if len(tr) else {},
         "wind": fit_wind(tr) if len(tr) else {},
     }
+    if series is not None and len(series):
+        s = series[(series["end"] <= now) & (series["end"] > now - dt.timedelta(days=window_days))]
+        cal["temp_3h"] = fit_hour_bias(s, cal)
+    return cal
 
 
 def predict(cal: dict | None, tab: pd.DataFrame) -> pd.DataFrame:
@@ -618,14 +796,32 @@ def frost_scores(f_t, rows: pd.DataFrame) -> dict | None:
     return out
 
 
+def series_scores(f, rows: pd.DataFrame) -> dict[int, dict]:
+    """Per lead day: temperature scores of the 3-hourly values ``f`` over all hours and per local hour."""
+    f, o = np.asarray(f, dtype=float), rows["o_t3"].values.astype(float)
+    hour, lead = rows["hour"].values, rows["lead"].values
+    out = {}
+    for ld in verify.LEADS:
+        s = (lead == ld) & np.isfinite(f) & np.isfinite(o)
+        out[ld] = {"all": verify.temp_scores(f[s], o[s]),
+                   "by_hour": {f"{h:02d}": verify.temp_scores(f[s & (hour == h)], o[s & (hour == h)])
+                               for h in SERIES_HOURS}}
+    return out
+
+
 def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None = None,
-             window_days: int = WINDOW_DAYS) -> dict[str, Any]:
+             window_days: int = WINDOW_DAYS, series: pd.DataFrame | None = None) -> dict[str, Any]:
     """Out-of-sample scores over the last ``test_days`` of issues, refitting before each one.
 
     Configurations, all on the same rows (every member present, observation available):
     ``new`` this consensus; ``new_raw`` the plain member mean (standard lapse,
     no correction); ``mean_bias`` the plain mean with one decaying-average bias
     per kind and lead (how the Open-Meteo engine corrects); ``ifs`` ECMWF IFS alone.
+
+    With the 3-hourly table ``series`` (:func:`series_training_table`), ``temp_3h``
+    scores the 3-hourly curve per lead day and local hour: ``current`` as drawn
+    (the period extremes' weights and bias, night term) and ``hour_bias`` with
+    the bias per local hour instead (:data:`HOUR_BIAS`).
     """
     if tab.empty:
         return {"error": "no archived runs yet", "days": 0}
@@ -633,12 +829,19 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
     inits = sorted(i for i in tab["init"].unique() if end - pd.Timedelta(days=test_days) < i <= end)
     if len(inits) < 10 or (tab["end"].min() > inits[0] - pd.Timedelta(days=20)):
         return {"error": "not enough verified days yet", "days": len(inits)}
-    preds = []
+    series = series if series is not None and len(series) else None
+    preds, preds3 = [], []
     for init in inits:
         issue = pd.Timestamp(init) + pd.Timedelta(hours=native.ISSUE_DELAY_H)
         test = tab[tab["init"] == init]
-        cal = fit(tab, now=issue.to_pydatetime(), window_days=window_days)
+        cal = fit(tab, now=issue.to_pydatetime(), window_days=window_days, series=series)
         p = predict(cal, test)
+        if series is not None:
+            t3 = series[series["init"] == init]
+            preds3.append(pd.DataFrame({"current": series_t(cal, t3),
+                                        "hour_bias": series_t(cal, t3, hour_bias=True,
+                                                              extreme=period_values(t3, test, p["t"]))},
+                                       index=t3.index))
         tr = tab[(tab["end"] <= issue) & (tab["end"] > issue - pd.Timedelta(days=window_days))]
         mean_raw = test[[f"{m}_t_std" for m in MEMBERS]].mean(axis=1, skipna=False)
         tr_mean = tr.assign(mean=tr[[f"{m}_t_std" for m in MEMBERS]].mean(axis=1, skipna=False))
@@ -683,6 +886,20 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
                          rows["lead"].values, bins=((0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.01)), min_events=10)
         if sc:
             heavy[f"{thr:g}"] = sc
+    temp3 = None
+    if preds3:
+        P3 = pd.concat(preds3)
+        rows3 = series.loc[P3.index]
+        ok3 = rows3[["o_t3", *[f"{m}_t3" for m in MEMBERS]]].notna().all(axis=1).values
+        labels = {"current": "逐3小时：沿用白天最高 / 夜间最低的权重与偏差（夜间加风速项）",
+                  "hour_bias": "逐3小时：同样的权重，偏差按北京时次和预报天数单独拟合"}
+        temp3 = {"order": list(labels), "in_use": "hour_bias" if HOUR_BIAS else "current",
+                 "hours": [f"{h:02d}" for h in SERIES_HOURS],
+                 "configs": {k: {"label": v, "scores": series_scores(np.where(ok3, P3[k].values, np.nan), rows3)}
+                             for k, v in labels.items()},
+                 "notes": "对比国家站 00、03……21 时（世界时，即北京时 08、11……05 时）的定时气温；"
+                          "按所在白天 / 夜间时段的预报天数分组，只用 3 家都有、有实况的时次。"
+                          "按时次的偏差与气温订正用同一窗口和近期加权，样本外；曲线不高于所报白天最高、不低于夜间最低。"}
     first, last = rows["init"].min(), rows["init"].max()
     return {
         "window": [(first + pd.Timedelta(days=1)).date().isoformat(), (last + pd.Timedelta(days=1)).date().isoformat()],
@@ -691,6 +908,7 @@ def backtest(tab: pd.DataFrame, *, test_days: int = 30, end: dt.datetime | None 
         "configs": configs, "pop": pop, "pop_label": "3 家模式雨量经逻辑回归校准",
         "heavy": heavy or None,
         "frost": frost_scores(t_(P["new_t"]), rows) or None,
+        "temp_3h": temp3,
         "notes": "白天最高对比 12 时（UTC）报的 24 小时最高气温，夜间最低对比 00 时报的 24 小时最低气温；"
                  "降水为 12 小时（白天 08—20 时、夜间 20—08 时），≥0.1 mm 为有雨，微量按无雨。"
                  "全部样本外：每次预报只用发布前已结束时段的实况拟合。",
@@ -900,13 +1118,18 @@ def refresh(root=DEFAULT_ROOT, *, archive_root=archive.DEFAULT_ROOT, obs_root=No
         if update_obs:
             # OGIMET serves about two months per request; same span as the Open-Meteo engine's archive
             obs_mod.update(obs_mod.ObsStore(obs_root), stations, days=OBS_DAYS, sess=sess, now=now)
-        tab = training_table(archive_root, obs_root, stations,
-                             since=now - dt.timedelta(days=WINDOW_DAYS + 40))
-        cal = fit(tab, now=now)
+        since = now - dt.timedelta(days=WINDOW_DAYS + 40)
+        tab = training_table(archive_root, obs_root, stations, since=since)
+        try:
+            series = series_training_table(archive_root, obs_root, stations, since=since, periods=tab)
+        except Exception as exc:  # noqa: BLE001 — the 3-hourly check is a report unless HOUR_BIAS is on
+            print(f"[consensus] 3-hourly table failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            series = None
+        cal = fit(tab, now=now, series=series)
         if not cal["temp"]["day"] and not cal["temp"]["night"]:
             raise RuntimeError("no matched forecast/observation pairs yet")
         cal["generated"] = now.isoformat(timespec="seconds")
-        scores = backtest(tab, end=pd.Timestamp(now))
+        scores = backtest(tab, end=pd.Timestamp(now), series=series)
         scores["generated"] = cal["generated"]
         try:
             scores["live"] = live_scores(root, obs_root, stations, now=now)

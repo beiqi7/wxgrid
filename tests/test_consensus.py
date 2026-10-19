@@ -120,6 +120,81 @@ def test_backtest_needs_history():
     assert consensus.backtest(_table(days=8), test_days=30)["error"]
 
 
+#: Observed temperature at each BJT hour relative to its period's extreme (白天 below the maximum, 夜间 above the minimum).
+OBS_SHAPE = {11: -3.0, 14: -0.5, 17: -1.0, 20: -4.0, 23: 5.0, 2: 3.0, 5: 1.0, 8: 0.5}
+
+
+def _series(tab, model_shape=OBS_SHAPE, seed=5):
+    """3-hourly rows for every period of ``tab``: observed and member values are the period's
+    extreme plus a diurnal shape (the members' ``model_shape`` may miss the observed one)."""
+    rng = np.random.default_rng(seed)
+    cols = [*consensus.KEYS, "o_t", *[f"{m}_{c}" for m in consensus.MEMBERS for c in ("t", "w")]]
+    parts = []
+    for back in (9, 6, 3, 0):
+        f = tab[cols].copy()
+        f["valid"] = f["end"] - pd.Timedelta(hours=back)
+        f["hour"] = (f["valid"] + pd.Timedelta(hours=8)).dt.hour
+        parts.append(f)
+    s = pd.concat(parts, ignore_index=True)
+    s["o_t3"] = s["o_t"] + s["hour"].map(OBS_SHAPE).values + rng.normal(0, 0.5, len(s))
+    for m in consensus.MEMBERS:
+        s[f"{m}_t3"] = s[f"{m}_t"] + s["hour"].map(model_shape).values + rng.normal(0, 0.5, len(s))
+    return s.drop(columns=["o_t", *[f"{m}_t" for m in consensus.MEMBERS]]).sort_values(
+        ["init", "station", "valid"]).reset_index(drop=True)
+
+
+def _mae(sc, lead, hour=None):
+    s = sc[lead]["all"] if hour is None else sc[lead]["by_hour"][hour]
+    return s["mae"]
+
+
+def test_3_hourly_curve_is_scored_by_hour_and_lead_out_of_sample():
+    tab = _table()
+    t3 = consensus.backtest(tab, test_days=25, series=_series(tab))["temp_3h"]
+    assert t3["order"] == ["current", "hour_bias"] and t3["in_use"] == "current"
+    assert t3["hours"] == ["02", "05", "08", "11", "14", "17", "20", "23"]
+    cur, hb = (t3["configs"][k]["scores"] for k in t3["order"])
+    assert set(cur) == {1, 2, 3, 4, 5} and set(cur[1]["by_hour"]) == set(t3["hours"])
+    assert cur[1]["all"]["n"] == hb[1]["all"]["n"] == 25 * 5 * 8          # issues x stations x hours
+    assert all(cur[ld]["all"]["n"] == 0 for ld in (4, 5))                 # the synthetic table stops at day 3
+    # the members get the diurnal shape right: the extremes' bias holds at every hour, a bias per hour costs ~nothing
+    for ld in (1, 2, 3):
+        assert abs(_mae(hb, ld) - _mae(cur, ld)) < 0.03
+        assert all(abs(s["bias"]) < 0.35 for s in cur[ld]["by_hour"].values())
+    # a forecast never sees its own observation
+    s3 = _series(tab)
+    cut = tab["init"].max() - pd.Timedelta(days=3)
+    late = s3.assign(o_t3=np.where(s3["end"] > cut + pd.Timedelta(days=4), s3["o_t3"] + 50.0, s3["o_t3"]))
+    a = consensus.backtest(tab, test_days=25, end=cut, series=s3)["temp_3h"]["configs"]
+    b = consensus.backtest(tab, test_days=25, end=cut, series=late)["temp_3h"]["configs"]
+    for k in ("current", "hour_bias"):
+        assert a[k]["scores"][1] == b[k]["scores"][1]
+    assert consensus.backtest(tab, test_days=25)["temp_3h"] is None       # no 3-hourly table: no key filled
+
+
+def test_hour_bias_fixes_a_diurnal_error_the_extremes_cannot_see():
+    """Members too warm in the evening and too flat in the morning, extremes right: the extremes'
+    bias leaves those hours wrong, the per-hour bias removes it."""
+    tab = _table()
+    shape = {**OBS_SHAPE, 11: -2.0, 20: -3.0, 23: 6.5, 2: 3.8}
+    t3 = consensus.backtest(tab, test_days=25, series=_series(tab, shape))["temp_3h"]
+    cur, hb = (t3["configs"][k]["scores"] for k in ("current", "hour_bias"))
+    for ld in (1, 2, 3):
+        assert _mae(hb, ld) < 0.8 * _mae(cur, ld)
+        for h, e in {"11": 1.0, "20": 1.0, "23": 1.5, "02": 0.8}.items():
+            assert cur[ld]["by_hour"][h]["bias"] == pytest.approx(e, abs=0.3)
+            assert abs(hb[ld]["by_hour"][h]["bias"]) < 0.3
+        assert _mae(hb, ld, "14") <= _mae(cur, ld, "14") + 0.05            # hours that were right stay right
+    cal = consensus.fit(tab, now=dt.datetime(2025, 8, 1), series=_series(tab, shape))
+    e = cal["temp_3h"]["1"]
+    assert set(e) == {"02", "05", "08", "11", "14", "17", "20", "23"} and e["23"]["n"] >= consensus.MIN_ROWS
+    assert consensus.hour_bias_delta(cal, "night", 1, 23) == pytest.approx(-1.5, abs=0.2)
+    assert consensus.hour_bias_delta(cal, "day", 1, 14) == pytest.approx(0.0, abs=0.2)
+    assert consensus.hour_bias_delta(cal, "day", 4, 14) == 0.0                # unfitted lead: the extremes' bias
+    np.testing.assert_allclose(consensus.hold_to_extreme([31.0, 29.0, 11.0, 13.0], ["day", "day", "night", "night"],
+                                                         [30.0, 30.0, 12.0, np.nan]), [30.0, 29.0, 12.0, 13.0])
+
+
 # ------------------------------------------------------------------ live engine, network replaced
 
 PTS = [Township("T1", "甲镇", 28.30, 117.70, 60.0), Township("T2", "乙乡", 27.90, 117.60, 600.0)]
@@ -365,6 +440,57 @@ def test_night_wind_term_moves_the_3_hourly_curve_with_the_minimum(tmp_path, mon
                 np.testing.assert_allclose(curve, curve0)
     assert nights >= 4
     assert hdoc["meta"]["n_hours"] > 100
+
+
+@pytest.mark.parametrize("hour_bias", [False, True])
+def test_3_hourly_table_reproduces_the_curve_on_the_page(tmp_path, monkeypatch, hour_bias):
+    """Rebuilt from the archived runs, the 3-hourly table and ``series_t`` give the page's curve at a
+    station, joined to that station's 3-hourly reports: ``temp_3h`` scores what is issued."""
+    from wxgrid import obs as obs_mod
+    _fake_members(monkeypatch)
+    st = obs_mod.Station("58730", "武夷山", 27.767, 118.033, 221.0)
+    town = obs_mod.as_townships([st])
+    by_lead = lambda a: {str(ld): {"w": {"ifs": 0.5, "aifs": 0.2, "gfs": 0.3}, "a": a, "n": 100}  # noqa: E731
+                         for ld in range(1, 6)}
+    cal = {"generated": "2026-10-07T23:00:00", "temp": {"day": by_lead(-0.7), "night": by_lead(0.4)},
+           "night_wind": {"b": 1.2, "mu": 0.3, "n": 500},
+           "temp_3h": {str(ld): {f"{h:02d}": {"a": 0.1 * h - 1.0, "n": 100} for h in consensus.SERIES_HOURS}
+                       for ld in range(1, 6)}}
+    monkeypatch.setattr(consensus, "refresh", lambda *a, **k: cal)
+    monkeypatch.setattr(consensus, "HOUR_BIAS", hour_bias)
+    prod, _ = native.compute(town, county="测试县", seat="武夷山", issue_utc=dt.datetime(2026, 10, 7, 23, 30),
+                             want_pop=False, data_dir=tmp_path, stations=[])
+    obs_mod.ObsStore(tmp_path / "obs").merge("58730", [{"time": f"2026-10-{d:02d}T{h:02d}:00", "t": d + h / 100}
+                                                       for d in range(8, 14) for h in range(0, 24, 3)])
+    tab = consensus.training_table(tmp_path / "archive", tmp_path / "obs", [st])
+    s3 = consensus.series_training_table(tmp_path / "archive", tmp_path / "obs", [st], periods=tab)
+    assert len(s3) == 10 * 4
+    assert set(s3.loc[s3["kind"] == "day", "hour"]) == {11, 14, 17, 20}
+    assert set(s3.loc[s3["kind"] == "night", "hour"]) == {23, 2, 5, 8}
+    assert s3["ifs_w"].notna().all(), "every row finds its period (same init, date, kind, lead, end)"
+    np.testing.assert_allclose(s3["o_t3"], s3["valid"].dt.day + s3["valid"].dt.hour / 100)
+
+    ext = consensus.period_values(s3, tab, consensus.consensus_t(cal, tab))
+    f = consensus.series_t(cal, s3, hour_bias=hour_bias, extreme=ext)
+    series = prod["series3h"]
+    page = dict(zip(series["times"], series["points"][town[0].id]["temp"]))
+    shown = np.array([page.get(t, np.nan) for t in (s3["valid"] + pd.Timedelta(hours=8)).dt.strftime("%Y-%m-%dT%H:00")],
+                     dtype=float)
+    hit = np.isfinite(shown)
+    assert hit.sum() >= 20
+    np.testing.assert_allclose(f[hit], shown[hit], atol=0.051)              # the page rounds to 0.1
+    if hour_bias:
+        assert np.abs(f - consensus.series_t(cal, s3)).max() > 0.5
+        day = (s3["kind"] == "day").values
+        assert np.isclose(f, ext)[day].any() and np.isclose(f, ext)[~day].any()   # held to 最高 / 最低
+        lead = np.array(series["lead_h"])
+        for p in prod["periods"]:
+            sel = (lead - 3 >= p["start_lead"]) & (lead <= p["end_lead"])
+            if not sel.any():
+                continue
+            curve = np.array(series["points"][town[0].id]["temp"], dtype=float)[sel]
+            c = p["cells"][0]
+            assert curve.min() >= c["tmin"] - 0.05 and curve.max() <= c["tmax"] + 0.05
 
 
 def test_uncalibrated_native_refuses_but_still_archives(tmp_path, monkeypatch):

@@ -196,6 +196,16 @@ def _print_native_extras(scores: dict) -> None:
     if frost:
         print("frost nights (min <= 0 C), observed/hit/false alarm: "
               + "  ".join(f"day {ld} {f['events']}/{f['hits']}/{f['false_alarms']}" for ld, f in frost.items()))
+    t3 = scores.get("temp_3h") or {}
+
+    def cell(s):
+        return f"{_f(s.get('mae'), 4, 2)}/{_f(s.get('bias'), 5, 2)}"
+    for key in t3.get("order") or []:
+        sc = t3["configs"][key]["scores"]
+        day1 = sc.get(1) or sc.get("1") or {}
+        print(f"3-hourly temperature, {key}{' (in use)' if key == t3.get('in_use') else ''}: MAE/bias days 1-5 "
+              + " ".join(cell((sc.get(ld) or sc.get(str(ld)) or {}).get("all") or {}) for ld in range(1, 6)))
+        print("  day 1 by BJT hour: " + " ".join(f"{h} {cell(s)}" for h, s in (day1.get("by_hour") or {}).items()))
     live = scores.get("live") or {}
     if live.get("scores"):
         print(f"as issued {live['window'][0]} .. {live['window'][1]} ({live['issues']} issues, "

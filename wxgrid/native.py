@@ -435,6 +435,13 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
                                                         {m: ds[f].values[:, sel] for m, ds in mds.items()})
         out[f] = arr
     out["tmax3"], out["tmin3"] = np.fmax(out["tmax3"], out["t2m"]), np.fmin(out["tmin3"], out["t2m"])
+    # the bias of each window's own local hour instead of its period extreme's (off by default)
+    hour_bias = consensus.HOUR_BIAS and bool((cal or {}).get("temp_3h"))
+    if hour_bias:
+        local_h = [(init_v + dt.timedelta(hours=int(s) + tz)).hour for s in steps_v]
+        d = np.array([consensus.hour_bias_delta(cal, kind, lead, h) for (kind, lead, _), h in zip(keys, local_h)])
+        for f in ("t2m", "tmax3", "tmin3"):
+            out[f] = out[f] + d[None, :]
 
     # ---- period extremes: consensus of each member's own period max/min (what was trained)
     issue_nominal = cycle + dt.timedelta(hours=ISSUE_DELAY_H)
@@ -462,7 +469,13 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
             sel = np.array([key[2] == k for key in keys])
             for f in ("t2m", "tmax3", "tmin3"):
                 out[f][:, sel] += adj[:, None]
+        if hour_bias:
+            # a bias of its own can carry the curve past the extreme stated next to it
+            sel = np.array([key[2] == k for key in keys])
+            out["t2m"][:, sel] = consensus.hold_to_extreme(out["t2m"][:, sel], p.kind, t[:, None])
         ext["tmax" if p.kind == "day" else "tmin"][:, k] = t
+    if hour_bias:
+        out["tmax3"], out["tmin3"] = np.fmax(out["tmax3"], out["t2m"]), np.fmin(out["tmin3"], out["t2m"])
 
     def mean_of(f):
         stack = [ds[f].values for ds in mds.values() if f in ds]
