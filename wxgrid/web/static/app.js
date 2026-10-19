@@ -281,9 +281,23 @@ function dateList(dates) {
   return dates.map((x, i) =>
     (i > 0 && x.slice(5, 7) === dates[i - 1].slice(5, 7)) ? `${Number(x.slice(8, 10))}日` : md(x)).join('、');
 }
+/** Alerts tied to one 白天/夜间 period: dated by the period, so last night's stays while it runs. */
+const PERIOD_ALERTS = new Set(['霜冻', '大风']);
+/** Alerts still ahead: from today on, plus a 霜冻/大风 of the night that began yesterday until 08 时. */
+function liveAlerts() {
+  const today = todayLocal();
+  const nights = new Set(livePeriods().filter(q => q.kind === 'night').map(q => q.date));
+  return (S.doc.conclusions.alerts || []).filter(a => a.date >= today || (PERIOD_ALERTS.has(a.type) && nights.has(a.date)));
+}
+/** The server names the period relative to the issue time (今天夜间); say it relative to now (今天凌晨). */
+function alertDetail(a) {
+  const d = a.detail || '';
+  const q = S.doc.periods.find(p => p.date === a.date && p.label && d.startsWith(p.label));
+  return q ? periodLabel(q) + d.slice(q.label.length) : d;
+}
 function renderAlerts() {
   const box = $('alerts');
-  const list = (S.doc.conclusions.alerts || []).filter(a => a.date >= todayLocal());
+  const list = liveAlerts().map(a => ({ ...a, detail: alertDetail(a) }));
   if (!list.length) { box.hidden = true; box.innerHTML = ''; return; }
   const byType = new Map();
   for (const a of list) {
@@ -649,7 +663,8 @@ function openSheet(id, from) {
     <p class="s-meta">海拔 <b>${n1(t.elevation)} m</b> · 模式地形 ${n1(t.model_elevation)} m
       · ${Number(t.lat).toFixed(3)}°N ${Number(t.lon).toFixed(3)}°E</p>
     <p class="s-note">比模式地形${dz >= 0 ? '高' : '低'} ${n1(Math.abs(dz))} m，按 −6.5 K/km 递减率，气温订正约 ${
-      corr >= 0 ? '+' : '−'}${n1(Math.abs(corr), 1)} K。</p>
+      corr >= 0 ? '+' : '−'}${n1(Math.abs(corr), 1)} K${S.doc.meta.engine === 'native'
+        ? '（白天；夜间改用模式自身在当地的递减率，保留山谷逆温）' : ''}。</p>
     <h4 class="s-h">未来三天 · 逐3小时</h4>
     <div id="s-3h" class="s-hourly"></div>
     <h4 class="s-h">白天 / 夜间</h4>
@@ -831,7 +846,8 @@ function renderAccuracy() {
       <thead><tr><th scope="col">方案</th>${leads.map(l => `<th scope="col">第${l}天</th>`).join('')}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    ${v.pop ? `<p class="note">明细里的降水概率（${esc(v.pop_label || '8 家模式各自订正后的有雨比例')}）：Brier 技巧评分 ${n1(v.pop.bss * 100)}%（相对气候概率）；
+    ${v.pop ? `<p class="note">明细里的降水概率（${esc(v.pop_label || '8 家模式各自订正后的有雨比例')}）：${
+      Number.isFinite(v.pop.bss) ? `Brier 技巧评分 ${n1(v.pop.bss * 100)}%（相对气候概率）；` : ''}
       ${v.pop.reliability.filter(r => r.n).map(r => `预报 ${Math.round(r.bin[0] * 100)}—${Math.round(r.bin[1] * 100)}% 时实况有雨 ${n1(r.observed * 100)}%`).join('，')}。</p>` : ''}
     ${heavyNote(v.heavy)}${frostNote(v.frost)}
     <p class="note">${esc(v.notes || '')} 每列最好的成绩加粗。</p>

@@ -347,7 +347,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _static(self, rel: str) -> None:
         rel = rel.lstrip("/")
         target = (STATIC_DIR / rel).resolve()
-        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+        # is_relative_to, not a string prefix: ".../static" is a prefix of ".../static_old/x" too
+        if not target.is_relative_to(STATIC_DIR.resolve()) or not target.is_file():
             return self._error(404, "not found")
         ctype = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                  ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml",

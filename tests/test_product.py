@@ -192,6 +192,16 @@ def test_series_3h_starts_after_the_issue_time_and_runs_72_hours():
     assert s["points"]["A"]["weather"][0] == "晴" and s["points"]["A"]["wind_force"][0] == 2
 
 
+def test_series_3h_survives_a_missing_window():
+    """Regression: a NaN wind crashed wind_name() and with it the whole engine's issue."""
+    gap = lambda v: (lambda s: np.nan if s == 18 else v)  # noqa: E731
+    doc = _doc(_ds(init="2026-09-27T12:00", u10=gap(3.0), v10=gap(0.0), precip=gap(0.0)))
+    p = doc["series3h"]["points"]["A"]
+    j = doc["series3h"]["lead_h"].index(18)
+    assert (p["wind_name"][j], p["wind_force"][j], p["wind_dir"][j], p["weather"][j]) == (None, None, None, "—")
+    assert p["wind_name"][j + 1] == "西风" and p["weather"][j + 1] == "晴"
+
+
 def test_heavy_rain_probabilities_reach_cells_county_and_api():
     from wxgrid.web.app import township_periods
     ds = _ds(precip=lambda s: 2.0 if 15 <= s <= 24 else 0.0)

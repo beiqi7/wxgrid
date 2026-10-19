@@ -330,6 +330,43 @@ def _fake_members(monkeypatch):
     monkeypatch.setattr(raw, "fetch", fake_fetch)
 
 
+@pytest.mark.parametrize("mean_wind", [0.5, 6.0])     # members' 2.2 m/s is windy / calm against it
+def test_night_wind_term_moves_the_3_hourly_curve_with_the_minimum(tmp_path, monkeypatch, mean_wind):
+    """The page shows 夜间最低 next to the 3-hourly curve: the curve must not dip below it."""
+    _fake_members(monkeypatch)
+
+    def issue(night_wind):
+        cal = {"generated": "2026-10-07T23:00:00", "temp": {"day": {}, "night": {}}, "night_wind": night_wind}
+        monkeypatch.setattr(consensus, "refresh", lambda *a, **k: cal)
+        prod, hdoc = native.compute(PTS, county="测试县", seat="甲镇", issue_utc=dt.datetime(2026, 10, 7, 23, 30),
+                                    want_pop=False, data_dir=tmp_path, stations=[], hourly=True)
+        return prod, hdoc
+
+    term = {"b": 1.2, "mu": float(np.log(mean_wind)), "n": 500}
+    adj = 1.2 * (np.log(np.hypot(2.0, 1.0)) - np.log(mean_wind))
+    prod, hdoc = issue(term)
+    base, _ = issue(None)
+    s, s0 = prod["series3h"], base["series3h"]
+    lead = np.array(s["lead_h"])
+    nights = 0
+    for p, p0 in zip(prod["periods"], base["periods"]):
+        sel = (lead - 3 >= p["start_lead"]) & (lead <= p["end_lead"])
+        if not sel.any():
+            continue
+        for c, c0 in zip(p["cells"], p0["cells"]):
+            curve = np.array(s["points"][c["point"]]["temp"], dtype=float)[sel]
+            curve0 = np.array(s0["points"][c["point"]]["temp"], dtype=float)[sel]
+            assert curve.min() >= c["tmin"] - 0.05 and curve.max() <= c["tmax"] + 0.05
+            if p["kind"] == "night":
+                nights += 1
+                assert c["tmin"] - c0["tmin"] == pytest.approx(adj, abs=0.02)
+                np.testing.assert_allclose(curve - curve0, adj, atol=0.11)    # series are rounded to 0.1
+            else:
+                np.testing.assert_allclose(curve, curve0)
+    assert nights >= 4
+    assert hdoc["meta"]["n_hours"] > 100
+
+
 def test_uncalibrated_native_refuses_but_still_archives(tmp_path, monkeypatch):
     """Not seeded yet: no member-mean product, but this issue's runs join the training set."""
     _fake_members(monkeypatch)

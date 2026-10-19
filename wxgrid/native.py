@@ -436,6 +436,34 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
         out[f] = arr
     out["tmax3"], out["tmin3"] = np.fmax(out["tmax3"], out["t2m"]), np.fmin(out["tmin3"], out["t2m"])
 
+    # ---- period extremes: consensus of each member's own period max/min (what was trained)
+    issue_nominal = cycle + dt.timedelta(hours=ISSUE_DELAY_H)
+    ext = {"tmax": np.full((len(pts), len(plan)), np.nan), "tmin": np.full((len(pts), len(plan)), np.nan)}
+    vals = {m: {"std": point_values(r, pts, lapse="std"), "local": point_values(r, pts, lapse="local")}
+            for m, r in runs.items()}
+    member_tot = {m: np.full((len(pts), len(plan)), np.nan) for m in runs}
+    for k, p in enumerate(plan):
+        start, end = _period_bounds(p, init_v)
+        per, wind = {}, []
+        for m, r in runs.items():
+            tt, pp, wv = period_stats(r, vals[m]["std" if p.kind == "day" else "local"], start, end, p.kind)
+            per[m] = tt if tt is not None else np.full(len(pts), np.nan)
+            if pp is not None:
+                member_tot[m][:, k] = pp
+            if wv is not None:
+                wind.append(wv)
+        t = consensus.combine_temperature(temp_cal, p.kind, lead_day(end, issue_nominal), per)
+        if p.kind == "night" and wind:
+            with np.errstate(invalid="ignore"):
+                adj = consensus.night_wind_adjust((cal or {}).get("night_wind"), np.nanmean(np.stack(wind), axis=0))
+            t = t + adj
+            # the whole night moves with its minimum, so the 3-hourly curve never
+            # contradicts the 夜间最低 stated next to it
+            sel = np.array([key[2] == k for key in keys])
+            for f in ("t2m", "tmax3", "tmin3"):
+                out[f][:, sel] += adj[:, None]
+        ext["tmax" if p.kind == "day" else "tmin"][:, k] = t
+
     def mean_of(f):
         stack = [ds[f].values for ds in mds.values() if f in ds]
         if not stack:
@@ -479,28 +507,6 @@ def compute(points, *, county: str, seat: str, days: int = 5, tz: float = 8.0, w
     ds = xr.Dataset({k: (("point", "step"), a) for k, a in out.items()}, coords=first.coords,
                     attrs={"init_time": init_v.isoformat(),
                            "source": "native(" + "+".join(runs) + f" {cycle:%Y%m%d%H})"})
-
-    # ---- period extremes: consensus of each member's own period max/min (what was trained)
-    issue_nominal = cycle + dt.timedelta(hours=ISSUE_DELAY_H)
-    ext = {"tmax": np.full((len(pts), len(plan)), np.nan), "tmin": np.full((len(pts), len(plan)), np.nan)}
-    vals = {m: {"std": point_values(r, pts, lapse="std"), "local": point_values(r, pts, lapse="local")}
-            for m, r in runs.items()}
-    member_tot = {m: np.full((len(pts), len(plan)), np.nan) for m in runs}
-    for k, p in enumerate(plan):
-        start, end = _period_bounds(p, init_v)
-        per, wind = {}, []
-        for m, r in runs.items():
-            tt, pp, wv = period_stats(r, vals[m]["std" if p.kind == "day" else "local"], start, end, p.kind)
-            per[m] = tt if tt is not None else np.full(len(pts), np.nan)
-            if pp is not None:
-                member_tot[m][:, k] = pp
-            if wv is not None:
-                wind.append(wv)
-        t = consensus.combine_temperature(temp_cal, p.kind, lead_day(end, issue_nominal), per)
-        if p.kind == "night" and wind:
-            with np.errstate(invalid="ignore"):
-                t = t + consensus.night_wind_adjust((cal or {}).get("night_wind"), np.nanmean(np.stack(wind), axis=0))
-        ext["tmax" if p.kind == "day" else "tmin"][:, k] = t
 
     # ---- probabilities (detail only): per period from the members, calibrated; per 3 h from GEFS
     pp = sp = None

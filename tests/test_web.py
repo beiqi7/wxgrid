@@ -233,6 +233,20 @@ def test_static_assets_revalidate_instead_of_going_stale(server):
         assert exc.code == 304
 
 
+def test_static_files_stay_inside_the_static_dir(server, tmp_path, monkeypatch):
+    """Regression: a string-prefix check let ``../static_old/x`` through (``static`` is its prefix)."""
+    base, _ = server
+    root = tmp_path / "pkg"
+    (root / "static").mkdir(parents=True)
+    (root / "static" / "ok.js").write_text("1", encoding="utf-8")
+    (root / "static_old").mkdir()
+    (root / "static_old" / "secret.js").write_text("2", encoding="utf-8")
+    monkeypatch.setattr(webapp, "STATIC_DIR", root / "static")
+    assert _status(f"{base}/static/ok.js") == 200
+    assert _status(f"{base}/static/..%2Fstatic_old%2Fsecret.js") == 404
+    assert _status(f"{base}/static/../static_old/secret.js") == 404
+
+
 def test_unknown_route_is_404(server):
     base, _ = server
     assert _status(f"{base}/api/nope") == 404

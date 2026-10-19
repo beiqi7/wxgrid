@@ -251,6 +251,8 @@ def test_multimodel_product_end_to_end(monkeypatch, tmp_path):
     c = prod["periods"][1]["cells"][0]                 # tomorrow daytime at 甲镇
     assert c["weather"] and "风" in c["wind_text"] and c["temp"] is not None
     assert hdoc["meta"]["n_hours"] > 100
+    # the bulletin names the members (it used to be rendered before they were known)
+    assert "成员：multimodel" not in prod["text"] and "、".join(m["member_names"]) in prod["text"]
     json.dumps(prod, allow_nan=False)
 
 

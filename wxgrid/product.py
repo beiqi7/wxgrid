@@ -165,15 +165,17 @@ def _series3h(ds: xr.Dataset, *, issue_utc_h: float, tz: float, hours: int,
     for i, pid in enumerate(ds["point"].values):
         s_i = sn[i] if sn is not None else np.zeros_like(pr[i])
         c_i = cl[i] if cl is not None else np.zeros_like(pr[i])
+        # a window a member did not cover is NaN: null in the JSON, never a crash or a made-up word
         pts[str(pid)] = {
-            "weather": [phenomena.window_text(float(a), float(b), float(c), gap) for a, b, c in zip(pr[i], s_i, c_i)],
+            "weather": [phenomena.window_text(float(a), float(b), float(c), gap) if np.isfinite(a) else "—"
+                        for a, b, c in zip(pr[i], s_i, c_i)],
             "temp": [_f(x, 1) for x in t[i]],
             "precip": [_f(x, 1) for x in pr[i]],
             "snow": [_f(x, 1) for x in s_i],
             "cloud": [_f(x * 100, 0) for x in c_i],
             "wind_dir": [_f(x, 0) for x in wd[i]],
-            "wind_name": [phenomena.wind_name(float(x)) for x in wd[i]],
-            "wind_force": [phenomena.beaufort(float(x)) for x in spd[i]],
+            "wind_name": [phenomena.wind_name(float(x)) if np.isfinite(x) else None for x in wd[i]],
+            "wind_force": [phenomena.beaufort(float(x)) if np.isfinite(x) else None for x in spd[i]],
             "wind_speed": [_f(x, 1) for x in spd[i]],
             "gust": [_f(x, 1) for x in gu[i]] if gu is not None else None,
             "pop": [None if not np.isfinite(x) else round(float(x)) for x in pop[i]] if pop is not None else None,
@@ -555,6 +557,7 @@ def compute_multimodel(points: list[Township], *, county: str, seat: str, days: 
         k: cal.get(k) for k in ("method", "window", "alpha", "n_pairs", "generated")}
     prod["meta"]["attribution"] = "Weather data by Open-Meteo.com (CC BY 4.0)"
     prod["verification"] = postproc.load_scores(verify_root or postproc.DEFAULT_ROOT)
+    prod["text"] = bulletin_mod.render(prod)  # build rendered it before the member names were known
     if not hourly:
         return prod, None
     hr = openmeteo.hourly_dataset(raw, points, init, range(1, plan[-1].end_lead + 1))
